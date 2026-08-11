@@ -1,103 +1,94 @@
 # Herdr Model Capacity
 
-A compact [Herdr](https://herdr.dev/) pane showing how much usable model
-capacity remains across your Anthropic, OpenAI, and OpenRouter billing accounts.
+A narrow, persistent [Herdr](https://herdr.dev/) pane showing current capacity
+for explicitly configured billing accounts. It reports account quota and credit
+headroom, not historical token usage or per-agent spend.
 
 ```text
+Model Capacity
+
 CLAUDE
-Personal Max
-  5h           ███████░░░  72%  ↻ 2h12m
-  7d           █████░░░░░  48%  ↻ 4d8h
+───────────────────────────────────
+Personal subscription
+  5h           ███████████  72%  ↻ 2h12m
+  7d           ███████      48%  ↻ 4d8h
 
-CODEX / OPENAI
-Personal ChatGPT
-  5h           ██████░░░░  63%
-  7d           ████████░░  82%
-
-OPENROUTER
-Personal
-  balance      $18.72 remaining
+CHATGPT / OPENAI
+───────────────────────────────────
+Work subscription
+  7d           █████████████ 82%
 ```
 
-This is current capacity, not historical token or spend analytics. Capacity is
-owned by a billing account and can be shared by Claude Code, Codex, Pi, or Amp
-panes without being duplicated per agent.
+Configured accounts remain visible when collection fails. A previous successful
+value is marked stale; an account with no cached value is shown as unavailable.
+Unknown and unsupported capacity is never rendered as zero.
 
-## Features
+## Install and open
 
-- Multiple accounts per provider
-- Claude 5-hour, weekly, and model-scoped subscription windows
-- ChatGPT/Codex subscription windows with structured local snapshot fallback
-- OpenRouter per-key limits or account-wide credits
-- Remaining capacity and reset times, rather than percentage consumed
-- Independent provider failures with last-successful-response caching
-- Distinct `unknown`, `unavailable`, `stale`, and zero-remaining states
-- Configurable percentage and dollar warning thresholds
-- Detailed and compact panes
-- Active Herdr pane-to-account attribution
-
-## Install
-
-Requires Herdr 0.7.4 or newer and a stable Rust toolchain with Cargo:
+Requires Herdr 0.8.0 or newer, Rust/Cargo to build, and Python 3 for pane
+toggling:
 
 ```bash
 herdr plugin install shrivatsas/herdr-model-capacity
 ```
 
-Open the pane directly:
-
-```bash
-herdr plugin pane open \
-  --plugin shrivatsa.model-capacity \
-  --entrypoint capacity
-```
-
-Or invoke the plugin action:
+The default action toggles a non-focused split on the right. It finds the
+plugin's pane in the current workspace, closes it if present, and otherwise
+opens one:
 
 ```bash
 herdr plugin action invoke shrivatsa.model-capacity.open-capacity
 ```
 
-Optional keybinding in `~/.config/herdr/config.toml`:
+The explicit placement actions replace an existing capacity pane cleanly, so
+they can also switch orientation:
+
+```bash
+herdr plugin action invoke shrivatsa.model-capacity.open-capacity-right
+herdr plugin action invoke shrivatsa.model-capacity.open-capacity-down
+```
+
+Example keybindings:
 
 ```toml
 [[keys.command]]
 key = "prefix+u"
 type = "plugin_action"
 command = "shrivatsa.model-capacity.open-capacity"
-description = "open model capacity"
+description = "toggle model capacity"
+
+[[keys.command]]
+key = "prefix+shift+u"
+type = "plugin_action"
+command = "shrivatsa.model-capacity.open-capacity-down"
+description = "move model capacity below"
 ```
 
-The compact pane entrypoint is `capacity-compact`.
+## Configure an explicit account registry
 
-## Configuration
-
-Herdr creates the plugin config directory during installation or linking. Find
-it with:
+Find the plugin config directory and create `model-capacity.json` there:
 
 ```bash
 herdr plugin config-dir shrivatsa.model-capacity
 ```
 
-Create `model-capacity.json` there. Without a config file, the plugin
-conservatively discovers the default Claude Code and Codex homes plus
-`OPENROUTER_API_KEY`.
+There is deliberately no implicit account discovery. Labels and account
+identity come only from this registry; CLI/harness credential discovery may be
+used to help author it, but never defines dashboard accounts.
 
 ```json
 {
   "refreshSeconds": 180,
   "warningPercent": 20,
   "criticalPercent": 10,
-  "warningUsd": 10,
-  "criticalUsd": 5,
   "accounts": [
     {
-      "provider": "anthropic",
-      "accountId": "personal-max",
-      "label": "Personal Max",
+      "provider": "openai",
+      "accountId": "personal-chatgpt",
+      "label": "Personal ChatGPT",
       "authType": "oauth",
-      "source": "claude-code",
-      "configDir": "~/.claude-personal"
+      "source": "codex",
+      "codexHome": "~/.codex-accounts/personal"
     },
     {
       "provider": "openai",
@@ -105,54 +96,112 @@ conservatively discovers the default Claude Code and Codex homes plus
       "label": "Work ChatGPT",
       "authType": "oauth",
       "source": "codex",
-      "codexHome": "~/.codex-work"
+      "codexHome": "~/.codex-accounts/work"
+    },
+    {
+      "provider": "anthropic",
+      "accountId": "work-claude",
+      "label": "Work Claude subscription",
+      "authType": "oauth",
+      "source": "claude-code",
+      "configDir": "~/.claude-accounts/work",
+      "allowKeychain": true
+    },
+    {
+      "provider": "anthropic",
+      "accountId": "personal-claude",
+      "label": "Personal Claude subscription",
+      "authType": "oauth",
+      "source": "claude-code",
+      "configDir": "~/.claude-accounts/personal",
+      "secretRef": {
+        "kind": "macos-keychain",
+        "service": "example-herdr-claude",
+        "account": "personal"
+      }
     },
     {
       "provider": "openrouter",
       "accountId": "personal-openrouter",
-      "label": "OpenRouter Personal",
+      "label": "Personal OpenRouter",
       "authType": "api",
       "source": "openrouter",
       "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY"
-    }
-  ],
-  "bindings": [
-    {
-      "agent": "pi",
-      "provider": "anthropic",
-      "accountId": "personal-max"
-    },
-    {
-      "agent": "amp",
-      "paneId": "optional-exact-herdr-pane-id",
-      "provider": "openai",
-      "accountId": "work-chatgpt"
     }
   ]
 }
 ```
 
-Secrets are named through environment variables and are never written to plugin
-state or diagnostics. `HERDR_CAPACITY_CONFIG` can override the config path.
+`HERDR_CAPACITY_CONFIG` may override the config path.
 
-### Provider notes
+### Optional agent linkage
 
-- **Claude:** reads Claude Code OAuth credentials. The quota endpoint is
-  undocumented, so responses are cached and failures degrade to stale data.
-- **Codex:** reads ChatGPT OAuth credentials and falls back to Codex's structured
-  session rate-limit snapshots. The subscription endpoint is undocumented.
-- **OpenRouter:** an inference key uses the documented `/api/v1/key` endpoint. A
-  management key uses `/api/v1/credits` for account-wide balance.
-- **Anthropic/OpenAI API keys:** ordinary keys do not expose a reliable prepaid
-  balance. The plugin displays `unknown` instead of mislabeling historical spend
-  as available capacity.
+The dashboard is account-only by default. To show an informational agent →
+account section at the bottom, set `"showBindings": true` and add explicit
+bindings:
 
-The plugin does not refresh rotating OAuth tokens. Run the owning CLI to refresh
-expired credentials.
+```json
+{
+  "showBindings": true,
+  "bindings": [
+    {
+      "agent": "pi",
+      "provider": "anthropic",
+      "accountId": "personal-claude"
+    }
+  ]
+}
+```
 
-Amp's provider route is dynamic server-side state and cannot reliably be
-inferred from model branding. Bind Amp panes explicitly when the billing account
-is known.
+Bindings never create or rename billing accounts. Dynamic Amp routing is not
+guessed.
+
+## Provider collection and limitations
+
+### ChatGPT/OpenAI
+
+Each ChatGPT account needs its own `CODEX_HOME`. The plugin starts the official
+`codex app-server --stdio` with that home, performs the initialize/initialized
+handshake, and requests `account/read` plus `account/rateLimits/read`. It
+correlates JSON-RPC responses by ID and ignores interleaved notifications. Codex
+owns authentication, storage, and refresh; the plugin never reads `auth.json`
+or copies OAuth tokens.
+
+Ordinary OpenAI API keys do not expose a reliable prepaid balance. Such an
+account is displayed as unknown rather than using historical organization cost.
+
+### Claude/Anthropic
+
+Claude Code's normal macOS login uses one shared `Claude Code-credentials`
+Keychain item. `CLAUDE_CONFIG_DIR` alone therefore does not isolate multiple
+subscription logins. `allowKeychain` enables that standard item for an account.
+
+For a credential created with official `claude setup-token`, use a
+`macos-keychain` `secretRef`. The plugin asks `security` for the named service
+and account and never writes or logs the returned value. Setup tokens can pass
+Claude authentication and inference while still receiving HTTP 403 from
+Claude's OAuth usage endpoint. The plugin therefore verifies that the reference
+exists and shows **quota unsupported for this credential type**; it does not
+render the 403 as zero or infer quota from inference success.
+
+The OAuth usage endpoint used for the standard Claude Code credential is not a
+documented public API. Successful values are cached; failures retain stale
+values. Ordinary Anthropic API keys do not expose a credit-balance endpoint.
+
+### OpenRouter
+
+An inference key uses the documented `/api/v1/key` endpoint. A management key
+uses `/api/v1/credits` for account-wide balance. Secrets are named by environment
+variable and are not stored in plugin config or state.
+
+## Security model
+
+- The registry stores labels, home/config paths, environment-variable names,
+  and Keychain service/account references—never OAuth or setup-token values.
+- Codex app-server is the sole owner of Codex auth and refresh.
+- Provider responses cached under the plugin state directory contain normalized
+  limits and errors, not credentials.
+- Diagnostics do not include secret values.
 
 ## Development
 
@@ -164,12 +213,13 @@ bash bin/build.sh
 herdr plugin link "$PWD"
 ```
 
-Useful checks:
+Focused checks:
 
 ```bash
 cargo fmt --check
+cargo test
 cargo clippy --all-targets -- -D warnings
-herdr plugin log list --plugin shrivatsa.model-capacity
+bash -n bin/*.sh
 ```
 
 The original implementation brief and research notes are in [SPEC.md](SPEC.md).

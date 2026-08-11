@@ -1,7 +1,7 @@
 id = "shrivatsa.model-capacity"
 name = "Model Capacity"
 version = "0.1.0"
-min_herdr_version = "0.7.4"
+min_herdr_version = "0.8.0"
 description = "Show remaining model-provider capacity by billing account"
 platforms = ["linux", "macos"]
 
@@ -16,22 +16,30 @@ command = ["bash", "bin/run-capacity.sh", "probe"]
 
 [[actions]]
 id = "open-capacity"
-title = "Open Model Capacity pane"
+title = "Toggle Model Capacity pane"
 contexts = ["global", "workspace", "pane"]
-command = ["bash", "bin/open-capacity.sh"]
+command = ["bash", "bin/open-capacity.sh", "toggle", "right"]
+
+[[actions]]
+id = "open-capacity-right"
+title = "Open Model Capacity pane on right"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/open-capacity.sh", "open", "right"]
+
+[[actions]]
+id = "open-capacity-down"
+title = "Open Model Capacity pane below"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/open-capacity.sh", "open", "down"]
 
 [[panes]]
 id = "capacity"
 title = "Model Capacity"
-placement = "popup"
-width = "76%"
-height = 36
+placement = "split"
 command = ["bash", "bin/run-capacity.sh", "pane"]
 
 [[panes]]
 id = "capacity-compact"
 title = "Capacity"
-placement = "popup"
-width = "34%"
-height = 24
+placement = "split"
 command = ["bash", "bin/run-capacity.sh", "compact"]

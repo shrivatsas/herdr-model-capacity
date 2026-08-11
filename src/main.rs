@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use glob::glob;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -9,10 +8,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration as StdDuration, SystemTime};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_REFRESH_SECONDS: i64 = 180;
@@ -56,6 +58,8 @@ struct CapacityAccount {
     fetched_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    collector_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -73,6 +77,8 @@ struct AccountSpec {
     #[serde(default)]
     allow_keychain: bool,
     #[serde(default)]
+    secret_ref: Option<SecretRef>,
+    #[serde(default)]
     codex_home: Option<PathBuf>,
     #[serde(default)]
     token_env: Option<String>,
@@ -80,6 +86,14 @@ struct AccountSpec {
     management_key_env: Option<String>,
     #[serde(default)]
     pi_auth_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretRef {
+    kind: String,
+    service: String,
+    account: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -102,6 +116,8 @@ struct Config {
     accounts: Option<Vec<AccountSpec>>,
     #[serde(default)]
     bindings: Vec<AgentBinding>,
+    #[serde(default)]
+    show_bindings: bool,
     #[serde(default)]
     refresh_seconds: Option<i64>,
     #[serde(default)]
@@ -148,6 +164,10 @@ fn expand_home(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn config_path() -> PathBuf {
     if let Some(path) = env::var_os("HERDR_CAPACITY_CONFIG") {
         return PathBuf::from(path);
@@ -181,15 +201,6 @@ fn load_config() -> Result<Config> {
     .with_context(|| format!("parse {}", path.display()))
 }
 
-fn stable_id(prefix: &str, path: &Path) -> String {
-    let digest = Sha256::digest(expand_home(path).to_string_lossy().as_bytes());
-    format!("{prefix}-{}", hex_lower(&digest[..5]))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> {
     let file = expand_home(config_dir).join(".credentials.json");
     if let Some(oauth) = read_json(file).and_then(|root| root.get("claudeAiOauth").cloned()) {
@@ -218,108 +229,41 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
         .cloned()
 }
 
-fn discover_accounts() -> Vec<AccountSpec> {
-    let mut result = Vec::new();
-    let claude_dir = env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".claude"));
-    if claude_credentials(&claude_dir, true).is_some() {
-        result.push(AccountSpec {
-            provider: "anthropic".into(),
-            account_id: stable_id("claude", &claude_dir),
-            label: "Claude subscription".into(),
-            auth_type: "oauth".into(),
-            source: "claude-code".into(),
-            config_dir: Some(claude_dir),
-            allow_keychain: true,
-            codex_home: None,
-            token_env: None,
-            management_key_env: None,
-            pi_auth_path: None,
-        });
-    }
-    if env::var_os("ANTHROPIC_API_KEY").is_some() {
-        result.push(api_account(
-            "anthropic",
-            "anthropic-api-env",
-            "Anthropic API",
+fn keychain_secret(reference: &SecretRef) -> Result<String> {
+    if reference.kind != "macos-keychain" {
+        return Err(anyhow!(
+            "unsupported secret reference kind: {}",
+            reference.kind
         ));
     }
-
-    let codex_home = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".codex"));
-    let auth = read_json(codex_home.join("auth.json"));
-    let has_sessions = !glob(&format!("{}/sessions/**/*.jsonl", codex_home.display()))
-        .map(|mut paths| paths.next().is_none())
-        .unwrap_or(true);
-    if auth.is_some() || has_sessions {
-        let oauth = auth.as_ref().is_some_and(|value| {
-            matches!(
-                value.get("auth_mode").and_then(Value::as_str),
-                Some("chatgpt" | "chatgpt_auth_tokens")
-            ) || value
-                .pointer("/tokens/access_token")
-                .and_then(Value::as_str)
-                .is_some()
-        });
-        result.push(AccountSpec {
-            provider: "openai".into(),
-            account_id: stable_id("codex", &codex_home),
-            label: if oauth {
-                "ChatGPT / Codex"
-            } else {
-                "OpenAI API"
-            }
-            .into(),
-            auth_type: if oauth { "oauth" } else { "api" }.into(),
-            source: "codex".into(),
-            config_dir: None,
-            allow_keychain: false,
-            codex_home: Some(codex_home),
-            token_env: None,
-            management_key_env: None,
-            pi_auth_path: None,
-        });
-    } else if env::var_os("OPENAI_API_KEY").is_some() {
-        result.push(api_account("openai", "openai-api-env", "OpenAI API"));
+    if !cfg!(target_os = "macos") {
+        return Err(anyhow!("macOS Keychain secret references require macOS"));
     }
-    if env::var_os("OPENROUTER_API_KEY").is_some() {
-        result.push(AccountSpec {
-            provider: "openrouter".into(),
-            account_id: "openrouter-env".into(),
-            label: "OpenRouter".into(),
-            auth_type: "api".into(),
-            source: "openrouter".into(),
-            config_dir: None,
-            allow_keychain: false,
-            codex_home: None,
-            token_env: Some("OPENROUTER_API_KEY".into()),
-            management_key_env: None,
-            pi_auth_path: None,
-        });
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            &reference.service,
+            "-a",
+            &reference.account,
+            "-w",
+        ])
+        .output()
+        .context("read macOS Keychain secret")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "no macOS Keychain item for the configured service and account"
+        ));
     }
-    result
-}
-
-fn api_account(provider: &str, account_id: &str, label: &str) -> AccountSpec {
-    AccountSpec {
-        provider: provider.into(),
-        account_id: account_id.into(),
-        label: label.into(),
-        auth_type: "api".into(),
-        source: "api".into(),
-        config_dir: None,
-        allow_keychain: false,
-        codex_home: None,
-        token_env: None,
-        management_key_env: None,
-        pi_auth_path: None,
+    let secret = String::from_utf8(output.stdout).context("Keychain secret is not UTF-8")?;
+    if secret.trim().is_empty() {
+        return Err(anyhow!("configured macOS Keychain item is empty"));
     }
+    Ok(secret)
 }
 
 fn configured_accounts(config: &Config) -> Result<Vec<AccountSpec>> {
-    let accounts = config.accounts.clone().unwrap_or_else(discover_accounts);
+    let accounts = config.accounts.clone().unwrap_or_default();
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for mut account in accounts {
@@ -438,6 +382,23 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
             "Anthropic exposes no API credit-balance endpoint for ordinary API keys",
         ));
     }
+    if let Some(reference) = &spec.secret_ref {
+        // setup-token credentials can authenticate Claude Code inference, but the
+        // official OAuth usage endpoint rejects them. Verify the reference exists
+        // without exposing the token, then report that capability honestly.
+        drop(keychain_secret(reference)?);
+        return Ok(vec![CapacityLimit {
+            name: "subscription quota".into(),
+            kind: "quota".into(),
+            unit: "percent".into(),
+            remaining: None,
+            total: None,
+            remaining_percent: None,
+            resets_at: None,
+            status: LimitStatus::Unknown,
+            detail: "setup-token authentication works for inference, but Claude's quota endpoint does not authorize this credential type".into(),
+        }]);
+    }
     let dir = spec
         .config_dir
         .clone()
@@ -500,25 +461,10 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     Ok(limits)
 }
 
-fn find_rate_limits(value: &Value) -> Option<&Value> {
-    match value {
-        Value::Object(map) => {
-            if map.get("rate_limits").is_some_and(Value::is_object) {
-                return map.get("rate_limits");
-            }
-            if map.get("primary_window").is_some_and(Value::is_object) {
-                return Some(value);
-            }
-            map.values().find_map(find_rate_limits)
-        }
-        Value::Array(items) => items.iter().find_map(find_rate_limits),
-        _ => None,
-    }
-}
-
 fn window_name(window: &Value, fallback: &str) -> String {
     let minutes = window
-        .get("window_minutes")
+        .get("windowDurationMins")
+        .or_else(|| window.get("window_minutes"))
         .and_then(Value::as_f64)
         .or_else(|| {
             window
@@ -534,7 +480,7 @@ fn window_name(window: &Value, fallback: &str) -> String {
     }
 }
 
-fn codex_windows(limits: &Value, observed_at: Option<SystemTime>) -> Vec<CapacityLimit> {
+fn codex_windows(limits: &Value) -> Vec<CapacityLimit> {
     let mut result = HashMap::new();
     for (key, fallback) in [
         ("primary", "5h"),
@@ -545,23 +491,18 @@ fn codex_windows(limits: &Value, observed_at: Option<SystemTime>) -> Vec<Capacit
         let Some(window) = limits.get(key).filter(|value| value.is_object()) else {
             continue;
         };
-        let mut reset = parse_time(window.get("resets_at").or_else(|| window.get("reset_at")));
-        if reset.is_none() {
-            let seconds = window
-                .get("resets_in_seconds")
-                .or_else(|| window.get("reset_after_seconds"))
-                .and_then(Value::as_i64);
-            if let Some(seconds) = seconds {
-                let age = observed_at
-                    .and_then(|time| time.elapsed().ok())
-                    .map(|duration| duration.as_secs() as i64)
-                    .unwrap_or(0);
-                reset = Some(Utc::now() + Duration::seconds(seconds - age));
-            }
-        }
+        let reset = parse_time(
+            window
+                .get("resetsAt")
+                .or_else(|| window.get("resets_at"))
+                .or_else(|| window.get("reset_at")),
+        );
         let limit = quota_limit(
             window_name(window, fallback),
-            window.get("used_percent").and_then(Value::as_f64),
+            window
+                .get("usedPercent")
+                .or_else(|| window.get("used_percent"))
+                .and_then(Value::as_f64),
             reset,
         );
         result.insert(limit.name.clone(), limit);
@@ -571,28 +512,138 @@ fn codex_windows(limits: &Value, observed_at: Option<SystemTime>) -> Vec<Capacit
     result
 }
 
-fn latest_codex_snapshot(home: &Path) -> Option<(Value, SystemTime)> {
-    let pattern = format!("{}/sessions/**/*.jsonl", expand_home(home).display());
-    let mut files: Vec<_> = glob(&pattern).ok()?.flatten().collect();
-    files.sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
-    files.reverse();
-    for path in files {
-        let text = fs::read_to_string(&path).ok()?;
-        let mut latest = None;
-        for line in text.lines().filter(|line| line.contains("\"rate_limits\"")) {
-            let parsed: Value = serde_json::from_str(line).ok()?;
-            if let Some(found) = find_rate_limits(&parsed) {
-                latest = Some(found.clone());
+struct AppServer {
+    child: Child,
+    stdin: ChildStdin,
+    messages: Receiver<Result<Value, String>>,
+}
+
+impl AppServer {
+    fn spawn(home: &Path) -> Result<Self> {
+        let mut child = Command::new("codex")
+            .args(["app-server", "--stdio"])
+            .env("CODEX_HOME", expand_home(home))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("start codex app-server")?;
+        let stdin = child.stdin.take().context("open codex app-server stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("open codex app-server stdout")?;
+        let (sender, messages) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let message = line.map_err(|error| error.to_string()).and_then(|line| {
+                    serde_json::from_str(&line).map_err(|error| error.to_string())
+                });
+                if sender.send(message).is_err() {
+                    break;
+                }
             }
-        }
-        if let Some(value) = latest {
-            let modified = fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .unwrap_or(SystemTime::now());
-            return Some((value, modified));
+        });
+        Ok(Self {
+            child,
+            stdin,
+            messages,
+        })
+    }
+
+    fn send(&mut self, message: Value) -> Result<()> {
+        serde_json::to_writer(&mut self.stdin, &message).context("write app-server request")?;
+        self.stdin
+            .write_all(b"\n")
+            .and_then(|()| self.stdin.flush())
+            .context("flush app-server request")
+    }
+
+    fn response(&self, id: i64) -> Result<Value> {
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        loop {
+            let message = self.receive_until(deadline)?;
+            if message.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(anyhow!("codex app-server request failed: {error}"));
+            }
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("codex app-server response omitted result"));
         }
     }
-    None
+
+    fn receive_until(&self, deadline: Instant) -> Result<Value> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("codex app-server response timeout"));
+        }
+        self.messages
+            .recv_timeout(remaining)
+            .map_err(|error| anyhow!("codex app-server response timeout: {error}"))?
+            .map_err(|error| anyhow!("invalid codex app-server output: {error}"))
+    }
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn collect_codex_app_server(home: &Path) -> Result<(Value, Value)> {
+    let mut server = AppServer::spawn(home)?;
+    server.send(serde_json::json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "herdr-model-capacity", "version": VERSION}
+        }
+    }))?;
+    server.response(1).context("initialize codex app-server")?;
+    server.send(serde_json::json!({"method": "initialized"}))?;
+    server.send(serde_json::json!({
+        "id": 2,
+        "method": "account/read",
+        "params": {"refreshToken": false}
+    }))?;
+    server.send(serde_json::json!({
+        "id": 3,
+        "method": "account/rateLimits/read"
+    }))?;
+    let deadline = Instant::now() + StdDuration::from_secs(10);
+    collect_app_server_responses(|| server.receive_until(deadline))
+}
+
+fn collect_app_server_responses(mut next: impl FnMut() -> Result<Value>) -> Result<(Value, Value)> {
+    let mut account = None;
+    let mut limits = None;
+    while account.is_none() || limits.is_none() {
+        let message = next()?;
+        match message.get("id").and_then(Value::as_i64) {
+            Some(2) => account = Some(app_server_result(message)?),
+            Some(3) => limits = Some(app_server_result(message)?),
+            _ => {}
+        }
+    }
+    Ok((
+        account.expect("account response collected"),
+        limits.expect("rate-limit response collected"),
+    ))
+}
+
+fn app_server_result(message: Value) -> Result<Value> {
+    if let Some(error) = message.get("error") {
+        return Err(anyhow!("codex app-server request failed: {error}"));
+    }
+    message
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("codex app-server response omitted result"))
 }
 
 fn collect_openai(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
@@ -602,37 +653,19 @@ fn collect_openai(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     let home = spec
         .codex_home
         .clone()
-        .unwrap_or_else(|| home_dir().join(".codex"));
-    if let Some(auth) = read_json(home.join("auth.json")) {
-        if let Some(token) = auth.pointer("/tokens/access_token").and_then(Value::as_str) {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {token}"))?,
-            );
-            if let Some(account_id) = auth.pointer("/tokens/account_id").and_then(Value::as_str) {
-                headers.insert(
-                    HeaderName::from_static("chatgpt-account-id"),
-                    HeaderValue::from_str(account_id)?,
-                );
-            }
-            if let Ok(data) = get_json("https://chatgpt.com/backend-api/wham/usage", headers) {
-                if let Some(limits) = find_rate_limits(&data) {
-                    let windows = codex_windows(limits, None);
-                    if !windows.is_empty() {
-                        return Ok(windows);
-                    }
-                }
-            }
-        }
+        .ok_or_else(|| anyhow!("codexHome is required for a ChatGPT account"))?;
+    let (account, response) = collect_codex_app_server(&home)?;
+    if account.get("account").is_none_or(Value::is_null) {
+        return Err(anyhow!("Codex is not authenticated in {}", home.display()));
     }
-    if let Some((snapshot, observed)) = latest_codex_snapshot(&home) {
-        return Ok(codex_windows(&snapshot, Some(observed)));
+    let limits = response
+        .get("rateLimits")
+        .ok_or_else(|| anyhow!("Codex rate-limit response omitted rateLimits"))?;
+    let windows = codex_windows(limits);
+    if windows.is_empty() {
+        return Err(anyhow!("Codex returned no quota windows"));
     }
-    Err(anyhow!(
-        "no Codex quota response or rate-limit snapshot in {}",
-        home.display()
-    ))
+    Ok(windows)
 }
 
 fn openrouter_token(spec: &AccountSpec) -> Option<String> {
@@ -728,26 +761,62 @@ fn collect_limits(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
 }
 
 fn cache_path(spec: &AccountSpec) -> PathBuf {
-    let raw = format!("{}-{}", spec.provider, spec.account_id);
-    let safe: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || "_.-".contains(ch) {
-                ch
-            } else {
-                '-'
-            }
+    let digest = Sha256::digest(format!("{}\0{}", spec.provider, spec.account_id).as_bytes());
+    state_dir().join(format!("account-{}.json", hex_lower(&digest[..16])))
+}
+
+fn collector_fingerprint(spec: &AccountSpec) -> String {
+    let secret = spec
+        .secret_ref
+        .as_ref()
+        .map(|reference| {
+            format!(
+                "{}\0{}\0{}",
+                reference.kind, reference.service, reference.account
+            )
         })
-        .collect();
-    state_dir().join(format!("{safe}.json"))
+        .unwrap_or_default();
+    let material = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        spec.provider,
+        spec.auth_type,
+        spec.source,
+        spec.config_dir
+            .as_ref()
+            .map(expand_home)
+            .unwrap_or_default()
+            .display(),
+        spec.allow_keychain,
+        spec.codex_home
+            .as_ref()
+            .map(expand_home)
+            .unwrap_or_default()
+            .display(),
+        spec.token_env.as_deref().unwrap_or_default(),
+        spec.management_key_env.as_deref().unwrap_or_default(),
+        spec.pi_auth_path
+            .as_ref()
+            .map(expand_home)
+            .unwrap_or_default()
+            .display(),
+        secret
+    );
+    hex_lower(&Sha256::digest(material.as_bytes()))
 }
 
 fn read_cached(spec: &AccountSpec) -> Option<CapacityAccount> {
-    serde_json::from_value(read_json(cache_path(spec))?).ok()
+    let account: CapacityAccount = serde_json::from_value(read_json(cache_path(spec))?).ok()?;
+    (account.collector_fingerprint == collector_fingerprint(spec)).then_some(account)
 }
 
 fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> CapacityAccount {
-    let cached = read_cached(spec);
+    let cached = read_cached(spec).map(|mut account| {
+        account.provider.clone_from(&spec.provider);
+        account.account_id.clone_from(&spec.account_id);
+        account.label.clone_from(&spec.label);
+        account.auth_type.clone_from(&spec.auth_type);
+        account
+    });
     if !force
         && cached.as_ref().is_some_and(|account| {
             (Utc::now() - account.fetched_at).num_seconds() < refresh_seconds
@@ -765,6 +834,7 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
                 limits,
                 fetched_at: Utc::now(),
                 error: String::new(),
+                collector_fingerprint: collector_fingerprint(spec),
             };
             if let Some(parent) = cache_path(spec).parent() {
                 let _ = fs::create_dir_all(parent);
@@ -803,6 +873,7 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
                     }],
                     fetched_at: Utc::now(),
                     error: detail,
+                    collector_fingerprint: collector_fingerprint(spec),
                 }
             }
         }
@@ -823,7 +894,7 @@ fn collect_all(config: &Config, force: bool) -> Result<Vec<CapacityAccount>> {
 fn provider_name(provider: &str) -> &'static str {
     match provider {
         "anthropic" => "CLAUDE",
-        "openai" => "CODEX / OPENAI",
+        "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
         _ => "UNKNOWN",
     }
@@ -889,7 +960,31 @@ fn limit_summary(limit: &CapacityLimit) -> String {
     }
 }
 
-fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool) -> String {
+fn truncate_text(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut used = 0;
+    let mut result = String::new();
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
+}
+
+fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: usize) -> String {
     let stale = if limit.status == LimitStatus::Stale {
         " ~"
     } else {
@@ -899,15 +994,19 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool) -> String
         limit.status,
         LimitStatus::Unknown | LimitStatus::Unavailable
     ) {
-        let detail = if compact || limit.detail.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", limit.detail)
-        };
-        return format!("{:<12} {}{detail}", limit.name, limit_summary(limit));
+        let summary = limit_summary(limit);
+        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+        let name = truncate_text(&limit.name, name_width);
+        return format!("{name:<name_width$} {summary}");
     }
     if limit.unit == "usd" {
         let remaining = limit.remaining.unwrap_or(0.0);
+        if compact {
+            let summary = format!("${remaining:.2}{stale}");
+            let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+            let name = truncate_text(&limit.name, name_width);
+            return format!("{name:<name_width$} {summary}");
+        }
         let color = if remaining < config.critical_usd.unwrap_or(5.0) {
             "\x1b[31m"
         } else if remaining < config.warning_usd.unwrap_or(10.0) {
@@ -921,10 +1020,12 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool) -> String
         );
     }
     let Some(percent) = limit.remaining_percent else {
-        return format!("{:<12} unknown", limit.name);
+        let name = truncate_text(&limit.name, width.saturating_sub(8).max(1));
+        return format!("{name} unknown");
     };
     if compact {
-        return format!("{:<6} {:>3}%{stale}", limit.name, percent.round());
+        let name = truncate_text(&limit.name, width.saturating_sub(6).max(1));
+        return format!("{name} {:>3}%{stale}", percent.round());
     }
     let reset = format_reset(limit.resets_at);
     let reset = if reset.is_empty() {
@@ -932,12 +1033,14 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool) -> String
     } else {
         format!("  ↻ {reset}")
     };
+    let fixed_width = 12 + 1 + 5 + stale.len() + reset.chars().count();
+    let bar_width = width.saturating_sub(fixed_width).max(4);
     format!(
         "{:<12} {} {:>3}%{stale}{reset}",
         limit.name,
         render_bar(
             percent,
-            10,
+            bar_width,
             config.warning_percent.unwrap_or(20.0),
             config.critical_percent.unwrap_or(10.0)
         ),
@@ -1075,7 +1178,26 @@ fn render_agents(config: &Config, accounts: &[CapacityAccount]) -> Vec<String> {
     lines
 }
 
-fn render(config: &Config, accounts: &[CapacityAccount], compact: bool) -> String {
+fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: usize) -> String {
+    if width < 20 {
+        let mut lines = vec![truncate_text("Capacity", width)];
+        for account in accounts {
+            let summary = account
+                .limits
+                .first()
+                .map(limit_summary)
+                .unwrap_or_else(|| "unknown".into());
+            lines.push(truncate_text(
+                &format!("{} {summary}", account.label),
+                width,
+            ));
+        }
+        if accounts.is_empty() {
+            lines.push(truncate_text("No accounts", width));
+        }
+        return lines.join("\n");
+    }
+    let compact = compact || width < 36;
     let mut lines = vec![
         if compact {
             "\x1b[1mCapacity\x1b[0m".into()
@@ -1084,9 +1206,6 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool) -> Strin
         },
         String::new(),
     ];
-    if !compact {
-        lines.extend(render_agents(config, accounts));
-    }
     for provider in ["anthropic", "openai", "openrouter"] {
         let group: Vec<_> = accounts
             .iter()
@@ -1100,9 +1219,10 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool) -> Strin
             provider_color(provider),
             provider_name(provider)
         ));
-        if !compact {
-            lines.push(String::new());
-        }
+        lines.push(format!(
+            "\x1b[2m{}\x1b[0m",
+            "─".repeat(width.saturating_sub(1).max(8))
+        ));
         for account in group {
             let stale = if account
                 .limits
@@ -1113,14 +1233,27 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool) -> Strin
             } else {
                 ""
             };
-            lines.push(format!("{}{stale}", account.label));
+            let label_width = width.saturating_sub(if stale.is_empty() { 1 } else { 9 });
+            lines.push(format!(
+                "\x1b[1m{}{stale}\x1b[0m",
+                truncate_text(&account.label, label_width)
+            ));
             for limit in &account.limits {
-                lines.push(format!("  {}", render_limit(limit, config, compact)));
+                lines.push(format!(
+                    "  {}",
+                    render_limit(limit, config, compact, width.saturating_sub(2))
+                ));
+                if !compact && !limit.detail.is_empty() {
+                    lines.push(format!(
+                        "  \x1b[2m{}\x1b[0m",
+                        truncate_text(&limit.detail, width.saturating_sub(2))
+                    ));
+                }
             }
             if !compact && !account.error.is_empty() {
                 lines.push(format!(
                     "  \x1b[2mlast refresh failed: {}\x1b[0m",
-                    account.error
+                    truncate_text(&account.error, width.saturating_sub(24))
                 ));
             }
             lines.push(String::new());
@@ -1128,11 +1261,41 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool) -> Strin
     }
     if accounts.is_empty() {
         lines.extend([
-            "No accounts discovered.".into(),
-            format!("Configure {}", config_path().display()),
+            truncate_text("No accounts configured.", width),
+            truncate_text(&format!("Configure {}", config_path().display()), width),
         ]);
     }
+    if config.show_bindings && !compact {
+        lines.push(String::new());
+        lines.extend(render_agents(config, accounts));
+    }
     lines.join("\n").trim_end().into()
+}
+
+fn terminal_width() -> usize {
+    if let Ok(tty) = fs::File::open("/dev/tty") {
+        if let Ok(output) = Command::new("stty")
+            .arg("size")
+            .stdin(Stdio::from(tty))
+            .output()
+        {
+            if output.status.success() {
+                if let Some(width) = String::from_utf8_lossy(&output.stdout)
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|width| *width > 0)
+                {
+                    return width;
+                }
+            }
+        }
+    }
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|width: &usize| *width > 0)
+        .unwrap_or(20)
 }
 
 fn read_key() -> Result<char> {
@@ -1154,12 +1317,14 @@ fn pane_view(compact: bool) -> Result<()> {
     let mut force = false;
     loop {
         let accounts = collect_all(&config, force)?;
-        let output = render(&config, &accounts, compact);
+        let width = terminal_width();
+        let output = render(&config, &accounts, compact, width);
         if !interactive {
             println!("{output}");
             return Ok(());
         }
-        println!("\x1b[2J\x1b[H{output}\n\n\x1b[2m[r] refresh · any other key closes\x1b[0m");
+        let prompt = truncate_text("[r] refresh · other closes", width);
+        println!("\x1b[2J\x1b[H{output}\n\n\x1b[2m{prompt}\x1b[0m");
         if !matches!(read_key()?, 'r' | 'R') {
             return Ok(());
         }
@@ -1213,7 +1378,7 @@ mod tests {
             "primary": {"window_minutes": 300, "used_percent": 37},
             "secondary": {"window_minutes": 10080, "used_percent": 18}
         });
-        let windows = codex_windows(&limits, None);
+        let windows = codex_windows(&limits);
         assert_eq!(
             windows
                 .iter()
@@ -1229,9 +1394,60 @@ mod tests {
             test_account("personal", "Personal", 28.0),
             test_account("work", "Work", 9.0),
         ];
-        let output = render(&Config::default(), &accounts, true);
+        let output = render(&Config::default(), &accounts, true, 40);
         assert!(output.contains("Personal") && output.contains("72%"));
         assert!(output.contains("Work") && output.contains("91%"));
+    }
+
+    #[test]
+    fn ultra_compact_render_never_exceeds_pty_width() {
+        let accounts = vec![test_account("personal", "個人 subscription", 28.0)];
+        let output = render(&Config::default(), &accounts, false, 4);
+        assert!(output.lines().all(|line| UnicodeWidthStr::width(line) <= 4));
+    }
+
+    #[test]
+    fn correlates_app_server_responses_and_ignores_notifications() {
+        let mut messages = vec![
+            json!({"method": "account/rateLimits/updated", "params": {}}),
+            json!({"id": 3, "result": {"rateLimits": {"primary": {}}}}),
+            json!({"id": 99, "result": {}}),
+            json!({"id": 2, "result": {"account": {"type": "chatgpt"}}}),
+        ]
+        .into_iter();
+        let (account, limits) =
+            collect_app_server_responses(|| Ok(messages.next().expect("test message"))).unwrap();
+        assert_eq!(account.pointer("/account/type"), Some(&json!("chatgpt")));
+        assert!(limits.get("rateLimits").is_some());
+    }
+
+    #[test]
+    fn surfaces_app_server_errors_without_token_fallback() {
+        let mut messages = vec![
+            json!({"id": 2, "error": {"code": -32000, "message": "not authenticated"}}),
+            json!({"id": 3, "result": {"rateLimits": {}}}),
+        ]
+        .into_iter();
+        let error = collect_app_server_responses(|| Ok(messages.next().expect("test message")))
+            .unwrap_err();
+        assert!(error.to_string().contains("not authenticated"));
+    }
+
+    #[test]
+    fn cache_keys_do_not_collapse_sanitized_account_ids() {
+        let first = test_spec("work/us", "~/.codex-a");
+        let second = test_spec("work-us", "~/.codex-a");
+        assert_ne!(cache_path(&first), cache_path(&second));
+    }
+
+    #[test]
+    fn collector_fingerprint_changes_with_codex_home() {
+        let first = test_spec("work", "~/.codex-a");
+        let second = test_spec("work", "~/.codex-b");
+        assert_ne!(
+            collector_fingerprint(&first),
+            collector_fingerprint(&second)
+        );
     }
 
     #[test]
@@ -1287,6 +1503,24 @@ mod tests {
             limits: vec![quota_limit("5h", Some(used), None)],
             fetched_at: Utc::now(),
             error: String::new(),
+            collector_fingerprint: String::new(),
+        }
+    }
+
+    fn test_spec(id: &str, codex_home: &str) -> AccountSpec {
+        AccountSpec {
+            provider: "openai".into(),
+            account_id: id.into(),
+            label: "Test".into(),
+            auth_type: "oauth".into(),
+            source: "codex".into(),
+            config_dir: None,
+            allow_keychain: false,
+            secret_ref: None,
+            codex_home: Some(codex_home.into()),
+            token_env: None,
+            management_key_env: None,
+            pi_auth_path: None,
         }
     }
 }

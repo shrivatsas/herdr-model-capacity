@@ -794,6 +794,31 @@ fn amp_money_limit(name: &str, remaining: &str, total: Option<&str>) -> Option<C
     Some(money_limit(name, parse_amp_decimal(remaining)?, total))
 }
 
+fn amp_metadata_line(line: &str) -> bool {
+    line.is_empty()
+        || [
+            "Signed in",
+            "Logged in as ",
+            "Account: ",
+            "Learn more:",
+            "Manage billing:",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        || line.starts_with("https://")
+        || line.starts_with("http://")
+}
+
+fn valid_amp_advice_suffix(suffix: &str) -> bool {
+    suffix.is_empty()
+        || ((suffix.starts_with(" (") || suffix.starts_with(" - "))
+            && (suffix.contains("https://") || suffix.contains("http://")))
+}
+
+fn valid_amp_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(char::is_control)
+}
+
 fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLimit>> {
     let lower = output.to_ascii_lowercase();
     if [
@@ -808,20 +833,13 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
         return Err(anyhow!("Amp CLI is signed out"));
     }
     let mut limits = Vec::new();
-    let mut capacity_lines = 0;
+    let mut contract_lines = 0;
     let mut parsed_lines = 0;
     for line in output.lines().map(str::trim) {
-        if [
-            "Amp Free:",
-            "Subscription ",
-            "Individual credits:",
-            "Workspace ",
-        ]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
-        {
-            capacity_lines += 1;
+        if amp_metadata_line(line) {
+            continue;
         }
+        contract_lines += 1;
         if let Some(rest) = line.strip_prefix("Amp Free: $") {
             let Some((remaining, rest)) = rest.split_once("/$") else {
                 continue;
@@ -866,6 +884,9 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             let Some((plan, rest)) = rest.split_once(": ") else {
                 continue;
             };
+            if !valid_amp_name(plan) {
+                continue;
+            }
             let Some((other, rest)) = rest.split_once("% other usage and ") else {
                 continue;
             };
@@ -906,24 +927,26 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             parsed_lines += 1;
             continue;
         }
-        if let Some(remaining) = line
+        if let Some((remaining, suffix)) = line
             .strip_prefix("Individual credits: $")
-            .and_then(|value| value.split_once(" remaining").map(|(amount, _)| amount))
+            .and_then(|value| value.split_once(" remaining"))
         {
-            if let Some(limit) = amp_money_limit("Individual credits", remaining, None) {
-                limits.push(limit);
-                parsed_lines += 1;
+            if valid_amp_advice_suffix(suffix) {
+                if let Some(limit) = amp_money_limit("Individual credits", remaining, None) {
+                    limits.push(limit);
+                    parsed_lines += 1;
+                }
             }
             continue;
         }
         if let Some(rest) = line.strip_prefix("Workspace ") {
-            let Some((name, remaining)) = rest
-                .split_once(": $")
-                .and_then(|(name, value)| Some((name, value.split_once(" remaining")?.0)))
-            else {
+            let Some((name, value)) = rest.split_once(": $") else {
                 continue;
             };
-            if !name.is_empty() {
+            let Some((remaining, suffix)) = value.split_once(" remaining") else {
+                continue;
+            };
+            if valid_amp_name(name) && valid_amp_advice_suffix(suffix) {
                 if let Some(limit) = amp_money_limit(&format!("Workspace {name}"), remaining, None)
                 {
                     limits.push(limit);
@@ -932,7 +955,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             }
         }
     }
-    if limits.is_empty() || parsed_lines != capacity_lines {
+    if limits.is_empty() || parsed_lines != contract_lines {
         return Err(anyhow!(
             "Amp usage output did not match text contract v{AMP_USAGE_TEXT_VERSION}"
         ));
@@ -1282,6 +1305,12 @@ fn truncate_text(text: &str, width: usize) -> String {
     result
 }
 
+fn pad_text(text: &str, width: usize) -> String {
+    let text = truncate_text(text, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(padding))
+}
+
 fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: usize) -> String {
     let stale = if limit.status == LimitStatus::Stale {
         " ~"
@@ -1294,16 +1323,14 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     ) {
         let summary = limit_summary(limit);
         let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-        let name = truncate_text(&limit.name, name_width);
-        return format!("{name:<name_width$} {summary}");
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
     if limit.unit == "usd" {
         let remaining = limit.remaining.unwrap_or(0.0);
         if compact {
             let summary = format!("${remaining:.2}{stale}");
             let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-            let name = truncate_text(&limit.name, name_width);
-            return format!("{name:<name_width$} {summary}");
+            return format!("{} {summary}", pad_text(&limit.name, name_width));
         }
         let color = if remaining < config.critical_usd.unwrap_or(5.0) {
             "\x1b[31m"
@@ -1313,8 +1340,8 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
             "\x1b[32m"
         };
         return format!(
-            "{:<12} {color}${remaining:.2}\x1b[0m remaining{stale}",
-            limit.name
+            "{} {color}${remaining:.2}\x1b[0m remaining{stale}",
+            pad_text(&limit.name, 12)
         );
     }
     let Some(percent) = limit.remaining_percent else {
@@ -1322,8 +1349,12 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         return format!("{name} unknown");
     };
     if compact {
-        let name = truncate_text(&limit.name, width.saturating_sub(6).max(1));
-        return format!("{name} {:>3}%{stale}", percent.round());
+        let summary = format!("{:>3}%{stale}", percent.round());
+        let name = truncate_text(
+            &limit.name,
+            width.saturating_sub(summary.chars().count() + 1).max(1),
+        );
+        return format!("{name} {summary}");
     }
     let reset = format_reset(limit.resets_at);
     let reset = if reset.is_empty() {
@@ -1334,8 +1365,8 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     let fixed_width = 12 + 1 + 5 + stale.len() + reset.chars().count();
     let bar_width = width.saturating_sub(fixed_width).max(4);
     format!(
-        "{:<12} {} {:>3}%{stale}{reset}",
-        limit.name,
+        "{} {} {:>3}%{stale}{reset}",
+        pad_text(&limit.name, 12),
         render_bar(
             percent,
             bar_width,
@@ -1777,6 +1808,10 @@ mod tests {
             "Amp Free: -1% remaining today (resets daily)",
             "Amp Free: 101% remaining today (resets daily)",
             "Individual credits: $NaN remaining",
+            "Individual credits: $5.00 remaining unexpected text",
+            "Individual credits: $5.00 remaining\nTeam Demo: $50.00 remaining",
+            "Workspace Demo\u{1b}[2J: $5.00 remaining",
+            "Subscription Demo\u{7}: 97% other usage and 100% orb usage remaining - resets upon renewal in 29 days",
             "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 999999999999999999 days",
         ] {
             assert!(parse_amp_usage_at(output, Utc::now()).is_err());
@@ -1863,6 +1898,44 @@ mod tests {
             assert!(output.contains("AMP"));
             assert!(output.contains("Amp billing"));
             assert!(output.contains("$25.64"));
+        }
+    }
+
+    #[test]
+    fn long_ascii_and_cjk_amp_names_stay_within_the_pane() {
+        let account = CapacityAccount {
+            provider: "amp".into(),
+            account_id: "billing".into(),
+            label: "Very long Amp billing account label".into(),
+            auth_type: "cli".into(),
+            limits: vec![
+                money_limit("Workspace A very long workspace capacity name", 24.0, None),
+                CapacityLimit {
+                    name: "非常に長いワークスペース名 · orb".into(),
+                    kind: "quota".into(),
+                    unit: "percent".into(),
+                    remaining: None,
+                    total: None,
+                    remaining_percent: Some(94.0),
+                    resets_at: None,
+                    status: LimitStatus::Ok,
+                    detail: String::new(),
+                },
+            ],
+            fetched_at: Utc::now(),
+            error: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        for width in [20, 30, 36, 80] {
+            let output = render(
+                &Config::default(),
+                std::slice::from_ref(&account),
+                false,
+                width,
+            );
+            assert!(output
+                .lines()
+                .all(|line| UnicodeWidthStr::width(strip_ansi(line).as_str()) <= width));
         }
     }
 
@@ -1965,6 +2038,23 @@ mod tests {
             error: String::new(),
             collector_fingerprint: String::new(),
         }
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut result = String::new();
+        let mut characters = text.chars();
+        while let Some(character) = characters.next() {
+            if character == '\u{1b}' {
+                for escaped in characters.by_ref() {
+                    if escaped == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                result.push(character);
+            }
+        }
+        result
     }
 
     fn test_spec(id: &str, codex_home: &str) -> AccountSpec {

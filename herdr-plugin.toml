@@ -1,0 +1,37 @@
+id = "shrivatsa.model-capacity"
+name = "Model Capacity"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Show remaining model-provider capacity by billing account"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["bash", "bin/build.sh"]
+
+[[actions]]
+id = "probe"
+title = "Show normalized model capacity diagnostics"
+contexts = ["global"]
+command = ["bash", "bin/run-capacity.sh", "probe"]
+
+[[actions]]
+id = "open-capacity"
+title = "Open Model Capacity pane"
+contexts = ["global", "workspace", "pane"]
+command = ["bash", "bin/open-capacity.sh"]
+
+[[panes]]
+id = "capacity"
+title = "Model Capacity"
+placement = "popup"
+width = "76%"
+height = 36
+command = ["bash", "bin/run-capacity.sh", "pane"]
+
+[[panes]]
+id = "capacity-compact"
+title = "Capacity"
+placement = "popup"
+width = "34%"
+height = 24
+command = ["bash", "bin/run-capacity.sh", "compact"]

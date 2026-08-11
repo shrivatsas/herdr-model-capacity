@@ -1,0 +1,2 @@
+Workspace Example One: $1,234.56 remaining
+Workspace Example Two: $78.90 remaining

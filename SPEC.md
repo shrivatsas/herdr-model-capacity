@@ -92,6 +92,7 @@ V1 providers:
 1. **Anthropic / Claude**
 2. **OpenAI / Codex**
 3. **OpenRouter**
+4. **Amp**
 
 Do not add OpenCode Go yet.
 
@@ -202,7 +203,7 @@ Model this around accounts rather than agents:
 
 ```ts
 type CapacityAccount = {
-  provider: "anthropic" | "openai" | "openrouter"
+  provider: "amp" | "anthropic" | "openai" | "openrouter"
 
   accountId: string
   label: string
@@ -550,9 +551,9 @@ herdr plugin pane open --plugin shrivatsa.model-capacity --entrypoint capacity
 The compact entrypoint is `capacity-compact`. In either pane, `r` bypasses the
 1–5 minute cache and refreshes all accounts; any other key closes the pane.
 
-Without configuration the plugin conservatively discovers the default Claude
-Code and Codex homes plus `OPENROUTER_API_KEY`. Multiple accounts and agent
-bindings are configured in `~/.config/herdr/model-capacity.json` (override with
+The explicit account registry is authoritative; the plugin does not create
+accounts from discovered identities. Accounts and optional agent bindings are
+configured in `~/.config/herdr/model-capacity.json` (override with
 `HERDR_CAPACITY_CONFIG`):
 
 ```json
@@ -586,6 +587,13 @@ bindings are configured in `~/.config/herdr/model-capacity.json` (override with
       "authType": "api",
       "source": "openrouter",
       "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY"
+    },
+    {
+      "provider": "amp",
+      "accountId": "amp-billing",
+      "label": "Amp billing",
+      "authType": "cli",
+      "source": "amp-cli"
     }
   ],
   "bindings": [
@@ -621,3 +629,15 @@ Agent bindings are inferred only when one billing account unambiguously matches
 Claude Code, Codex, or Pi's configured provider. Multiple matching accounts
 require an explicit binding. Ampcode routing is dynamic server-side state and is
 never guessed from model branding, so Amp panes require an explicit binding.
+This is separate from an Amp billing account with `provider: "amp"`.
+
+Amp capacity is collected only through official authenticated `amp usage`, with
+`NO_COLOR=1`, null stdin, and a bounded overall timeout. Amp CLI owns all
+authentication. An optional `ampSettingsPath` supports multiple CLI identities
+by passing the non-secret path through `--settings-file`; the registry never
+stores credentials and parsed identity text never supplies the account label.
+The version-1 text parser normalizes Amp Free dollar and daily-percent forms,
+subscription other/orb lanes, individual credits, and every reported workspace
+balance. Renewal resets are approximate and are derived only from a reported
+day count. Missing CLI/authentication, command failure, timeout, or text drift
+uses the standard unavailable/stale behavior and never synthesizes zero.

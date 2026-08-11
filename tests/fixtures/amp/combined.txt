@@ -1,0 +1,8 @@
+Account: person@example.invalid
+
+Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 29 days
+Individual credits: $25.64 remaining (manage auto-reload) - https://example.invalid/settings
+Workspace Example One: $1,234.56 remaining
+Workspace Example Two: $78.90 remaining
+
+Manage billing: https://example.invalid/billing

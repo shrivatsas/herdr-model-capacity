@@ -548,8 +548,8 @@ herdr plugin link "$PWD"
 herdr plugin pane open --plugin shrivatsa.model-capacity --entrypoint capacity
 ```
 
-The compact entrypoint is `capacity-compact`. In either pane, `r` bypasses the
-1–5 minute cache and refreshes all accounts; any other key closes the pane.
+The pane switches to a compact layout at narrow widths. Pressing `r` bypasses
+the 1–5 minute cache and refreshes all accounts; any other key closes the pane.
 
 The explicit account registry is authoritative; the plugin does not create
 accounts from discovered identities. Accounts and optional agent bindings are

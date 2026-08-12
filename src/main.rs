@@ -845,7 +845,12 @@ fn amp_money_limit(name: &str, remaining: &str, total: Option<&str>) -> Option<C
         Some(value) => Some(parse_amp_decimal(value)?),
         None => None,
     };
-    Some(money_limit(name, parse_amp_decimal(remaining)?, total))
+    let remaining = parse_amp_decimal(remaining)?;
+    let mut limit = money_limit(name, remaining, total);
+    limit.remaining_percent = total
+        .filter(|total| *total > 0.0)
+        .map(|total| clamp_percent(remaining / total * 100.0));
+    Some(limit)
 }
 
 fn amp_metadata_line(line: &str) -> bool {
@@ -1030,7 +1035,7 @@ fn read_pipe(mut pipe: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8
     receiver
 }
 
-fn stop_command(child: &mut Child) {
+fn stop_running_command(child: &mut Child) {
     #[cfg(unix)]
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -1075,7 +1080,7 @@ fn command_stdout_with_timeout(
             break status;
         }
         if Instant::now() >= deadline {
-            stop_command(&mut child);
+            stop_running_command(&mut child);
             return Err(anyhow!(
                 "command timed out after {}s",
                 timeout.as_secs_f64()
@@ -1085,21 +1090,12 @@ fn command_stdout_with_timeout(
     };
     let receive = |reader: &Receiver<io::Result<Vec<u8>>>| {
         reader
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .recv_timeout(StdDuration::from_secs(1))
             .map_err(|_| anyhow!("command output collection timed out"))?
             .map_err(anyhow::Error::from)
     };
-    let stdout = match receive(&stdout) {
-        Ok(stdout) => stdout,
-        Err(error) => {
-            stop_command(&mut child);
-            return Err(error);
-        }
-    };
-    if let Err(error) = receive(&stderr) {
-        stop_command(&mut child);
-        return Err(error);
-    }
+    let stdout = receive(&stdout)?;
+    receive(&stderr)?;
     if !status.success() {
         return Err(anyhow!("command failed with status {status}"));
     }
@@ -1741,6 +1737,13 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
 }
 
 fn terminal_width() -> usize {
+    if let Some(width) = env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|width: &usize| *width > 0)
+    {
+        return width;
+    }
     if let Ok(tty) = fs::File::open("/dev/tty") {
         if let Ok(output) = Command::new("stty")
             .arg("size")
@@ -1759,11 +1762,7 @@ fn terminal_width() -> usize {
             }
         }
     }
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|width: &usize| *width > 0)
-        .unwrap_or(20)
+    20
 }
 
 fn read_key() -> Result<char> {
@@ -1868,6 +1867,9 @@ mod tests {
         assert_eq!(limits[0].name, "Amp Free");
         assert_eq!(limits[0].remaining, Some(4.71));
         assert_eq!(limits[0].total, Some(10.0));
+        assert!(limits[0]
+            .remaining_percent
+            .is_some_and(|percent| (percent - 47.1).abs() < 0.001));
         assert_eq!(limits[0].detail, "replenishes $0.42/hour");
     }
 

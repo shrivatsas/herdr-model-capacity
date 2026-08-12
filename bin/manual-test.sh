@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="preview"
-WIDTH="${COLUMNS:-80}"
+WIDTH="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
 
 usage() {
   cat <<'EOF'

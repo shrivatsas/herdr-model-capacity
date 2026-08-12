@@ -13,9 +13,11 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     mpsc::{self, Receiver},
-    OnceLock,
+    Arc, OnceLock,
 };
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -1062,14 +1064,51 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
     Ok(limits)
 }
 
-fn read_pipe(mut pipe: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8>>> {
+#[cfg(unix)]
+fn read_pipe(
+    mut pipe: impl Read + AsRawFd + Send + 'static,
+    child_exited: Arc<AtomicBool>,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(output),
+                Ok(read) => output.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if child_exited.load(Ordering::Acquire) {
+                        break Ok(output);
+                    }
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    Ok(receiver)
+}
+
+#[cfg(not(unix))]
+fn read_pipe(
+    mut pipe: impl Read + Send + 'static,
+    _child_exited: Arc<()>,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut output = Vec::new();
         let result = pipe.read_to_end(&mut output).map(|_| output);
         let _ = sender.send(result);
     });
-    receiver
+    Ok(receiver)
 }
 
 fn command_diagnostic(bytes: &[u8]) -> String {
@@ -1123,8 +1162,18 @@ fn command_stdout_with_timeout(
     let mut child = command
         .spawn()
         .with_context(|| format!("start {}", program.display()))?;
-    let stdout = read_pipe(child.stdout.take().context("capture command stdout")?);
-    let stderr = read_pipe(child.stderr.take().context("capture command stderr")?);
+    #[cfg(unix)]
+    let child_exited = Arc::new(AtomicBool::new(false));
+    #[cfg(not(unix))]
+    let child_exited = Arc::new(());
+    let stdout = read_pipe(
+        child.stdout.take().context("capture command stdout")?,
+        Arc::clone(&child_exited),
+    )?;
+    let stderr = read_pipe(
+        child.stderr.take().context("capture command stderr")?,
+        Arc::clone(&child_exited),
+    )?;
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().context("wait for command")? {
@@ -1132,6 +1181,8 @@ fn command_stdout_with_timeout(
         }
         if Instant::now() >= deadline {
             stop_running_command(&mut child);
+            #[cfg(unix)]
+            child_exited.store(true, Ordering::Release);
             return Err(anyhow!(
                 "command timed out after {}s",
                 timeout.as_secs_f64()
@@ -1139,6 +1190,8 @@ fn command_stdout_with_timeout(
         }
         thread::sleep(StdDuration::from_millis(10));
     };
+    #[cfg(unix)]
+    child_exited.store(true, Ordering::Release);
     let receive = |reader: &Receiver<io::Result<Vec<u8>>>| {
         reader
             .recv_timeout(StdDuration::from_secs(1))
@@ -1489,9 +1542,21 @@ fn render_money_limit(
     if compact {
         return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
-    let color = if remaining < config.critical_usd.unwrap_or(5.0) {
+    let color_value = limit.remaining_percent.unwrap_or(remaining);
+    let (warning, critical) = if limit.total.is_some() {
+        (
+            config.warning_percent.unwrap_or(20.0),
+            config.critical_percent.unwrap_or(10.0),
+        )
+    } else {
+        (
+            config.warning_usd.unwrap_or(10.0),
+            config.critical_usd.unwrap_or(5.0),
+        )
+    };
+    let color = if color_value < critical {
         "\x1b[31m"
-    } else if remaining < config.warning_usd.unwrap_or(10.0) {
+    } else if color_value < warning {
         "\x1b[33m"
     } else {
         "\x1b[32m"
@@ -1519,11 +1584,12 @@ fn render_amp_limits(
         });
         if let Some(plan) = subscription {
             if !compact {
-                let renewal = limit
-                    .detail
-                    .strip_prefix("renewal reported in ")
-                    .map(|value| format!(" [renewal in {value}]"))
-                    .unwrap_or_default();
+                let reset = format_reset(limit.resets_at);
+                let renewal = if reset.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [renewal in {reset}]")
+                };
                 lines.push(format!(
                     "  \x1b[1m{}\x1b[0m",
                     truncate_text(&format!("{plan}{renewal}"), width.saturating_sub(2))
@@ -2108,6 +2174,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn successful_command_does_not_wait_for_descendant_pipe_holders() {
+        let started = Instant::now();
+        let output = command_stdout_with_timeout(
+            Path::new("sh"),
+            &["-c".into(), "sleep 2 & printf ok".into()],
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output, b"ok");
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn command_failure_includes_sanitized_stderr() {
         let error = command_stdout_with_timeout(
             Path::new("sh"),
@@ -2224,7 +2304,7 @@ mod tests {
             false,
             80,
         ));
-        assert!(output.contains("Megawatt [renewal in 29 days]"));
+        assert!(output.contains("Megawatt [renewal in "));
         assert!(output.contains("Other"));
         assert!(output.contains("Orbs"));
         assert!(output.contains("Available Credits"));
@@ -2242,6 +2322,18 @@ mod tests {
             80,
         );
         assert!(warning_output.contains("\x1b[31m$25.64\x1b[0m"));
+
+        let mut expired = account.clone();
+        expired.limits[0].resets_at = Some(Utc::now() - Duration::days(1));
+        expired.limits[1].resets_at = expired.limits[0].resets_at;
+        let expired_output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&expired),
+            false,
+            80,
+        ));
+        assert!(!expired_output.contains("renewal in"));
+        assert!(!expired_output.contains("renewal reported"));
     }
 
     #[test]
@@ -2252,14 +2344,9 @@ mod tests {
         assert!(!compact.contains("remaining"));
 
         let amp_free = amp_money_limit("Amp Free", "4.71", Some("10")).unwrap();
-        let wide = strip_ansi(&render_money_limit(
-            &amp_free,
-            &Config::default(),
-            false,
-            true,
-            80,
-        ));
-        assert!(wide.contains("$4.71/$10.00 remaining"));
+        let wide = render_money_limit(&amp_free, &Config::default(), false, true, 80);
+        assert!(strip_ansi(&wide).contains("$4.71/$10.00 remaining"));
+        assert!(wide.contains("\x1b[32m$4.71\x1b[0m"));
     }
 
     #[test]

@@ -37,9 +37,3 @@ id = "capacity"
 title = "Model Capacity"
 placement = "split"
 command = ["bash", "bin/run-capacity.sh", "pane"]
-
-[[panes]]
-id = "capacity-compact"
-title = "Capacity"
-placement = "split"
-command = ["bash", "bin/run-capacity.sh", "compact"]

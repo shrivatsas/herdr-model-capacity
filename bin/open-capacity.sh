@@ -25,15 +25,24 @@ if [[ -z "$WORKSPACE" ]]; then
 fi
 
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-$HOME/.local/state/herdr-model-capacity}"
-SAFE_WORKSPACE="$(printf '%s' "$WORKSPACE" | tr -c 'A-Za-z0-9_.-' '-')"
+WORKSPACE_KEY="$(printf '%s' "$WORKSPACE" | shasum -a 256 | awk '{print $1}')"
 mkdir -p "$STATE_DIR"
-STATE_FILE="$STATE_DIR/pane-$SAFE_WORKSPACE"
-LOCK_DIR="$STATE_DIR/pane-$SAFE_WORKSPACE.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "model-capacity: another pane action is already running" >&2
-  exit 1
-fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+STATE_FILE="$STATE_DIR/pane-$WORKSPACE_KEY"
+LOCK_DIR="$STATE_DIR/pane-$WORKSPACE_KEY.lock"
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ "$LOCK_PID" =~ ^[0-9]+$ ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "model-capacity: another pane action is already running" >&2
+    exit 1
+  fi
+  STALE_LOCK="$LOCK_DIR.stale.$$"
+  if mv "$LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
+    rm -f "$STALE_LOCK/pid"
+    rmdir "$STALE_LOCK" 2>/dev/null || true
+  fi
+done
+printf '%s\n' "$$" >"$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 # Refresh after taking the lock so a completed concurrent open cannot be
 # mistaken for stale state based on the pre-lock snapshot.

@@ -8,10 +8,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    mpsc::{self, Receiver},
+    OnceLock,
+};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -113,7 +116,7 @@ struct AgentBinding {
 #[serde(rename_all = "camelCase")]
 struct Config {
     #[serde(default)]
-    accounts: Option<Vec<AccountSpec>>,
+    accounts: Vec<AccountSpec>,
     #[serde(default)]
     bindings: Vec<AgentBinding>,
     #[serde(default)]
@@ -229,7 +232,7 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
         .cloned()
 }
 
-fn keychain_secret(reference: &SecretRef) -> Result<String> {
+fn keychain_item_exists(reference: &SecretRef) -> Result<()> {
     if reference.kind != "macos-keychain" {
         return Err(anyhow!(
             "unsupported secret reference kind: {}",
@@ -246,7 +249,6 @@ fn keychain_secret(reference: &SecretRef) -> Result<String> {
             &reference.service,
             "-a",
             &reference.account,
-            "-w",
         ])
         .output()
         .context("read macOS Keychain secret")?;
@@ -255,45 +257,88 @@ fn keychain_secret(reference: &SecretRef) -> Result<String> {
             "no macOS Keychain item for the configured service and account"
         ));
     }
-    let secret = String::from_utf8(output.stdout).context("Keychain secret is not UTF-8")?;
-    if secret.trim().is_empty() {
-        return Err(anyhow!("configured macOS Keychain item is empty"));
-    }
-    Ok(secret)
+    Ok(())
 }
 
-fn configured_accounts(config: &Config) -> Result<Vec<AccountSpec>> {
-    let accounts = config.accounts.clone().unwrap_or_default();
+fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
+    CapacityAccount {
+        provider: if matches!(
+            spec.provider.as_str(),
+            "anthropic" | "openai" | "openrouter"
+        ) {
+            spec.provider.clone()
+        } else {
+            "invalid".into()
+        },
+        account_id: spec.account_id.clone(),
+        label: if spec.label.is_empty() {
+            "Invalid account".into()
+        } else {
+            spec.label.clone()
+        },
+        auth_type: spec.auth_type.clone(),
+        limits: vec![CapacityLimit {
+            name: "capacity".into(),
+            kind: "quota".into(),
+            unit: "percent".into(),
+            remaining: None,
+            total: None,
+            remaining_percent: None,
+            resets_at: None,
+            status: LimitStatus::Unavailable,
+            detail: detail.clone(),
+        }],
+        fetched_at: Utc::now(),
+        error: detail,
+        collector_fingerprint: String::new(),
+    }
+}
+
+fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccount>) {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
-    for mut account in accounts {
+    let mut errors = Vec::new();
+    for mut account in config.accounts.clone() {
         account.provider = account.provider.to_lowercase();
         if !matches!(
             account.provider.as_str(),
             "anthropic" | "openai" | "openrouter"
         ) {
+            let detail = format!("unknown provider: {}", account.provider);
+            errors.push(unavailable_account(&account, detail));
             continue;
         }
         if account.account_id.is_empty() || account.label.is_empty() {
+            errors.push(unavailable_account(
+                &account,
+                "accountId and label must both be non-empty".into(),
+            ));
             continue;
         }
         if !seen.insert((account.provider.clone(), account.account_id.clone())) {
-            return Err(anyhow!(
+            let detail = format!(
                 "duplicate capacity account: {}/{}",
-                account.provider,
-                account.account_id
-            ));
+                account.provider, account.account_id
+            );
+            errors.push(unavailable_account(&account, detail));
+            continue;
         }
         result.push(account);
     }
-    Ok(result)
+    (result, errors)
 }
 
-fn client() -> Result<Client> {
-    Client::builder()
+fn client() -> Result<&'static Client> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = Client::builder()
         .timeout(StdDuration::from_secs(10))
         .build()
-        .context("build HTTP client")
+        .context("build HTTP client")?;
+    let _ = CLIENT.set(client);
+    Ok(CLIENT.get().expect("HTTP client was initialized"))
 }
 
 fn get_json(url: &str, mut headers: HeaderMap) -> Result<Value> {
@@ -386,7 +431,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         // setup-token credentials can authenticate Claude Code inference, but the
         // official OAuth usage endpoint rejects them. Verify the reference exists
         // without exposing the token, then report that capability honestly.
-        drop(keychain_secret(reference)?);
+        keychain_item_exists(reference)?;
         return Ok(vec![CapacityLimit {
             name: "subscription quota".into(),
             kind: "quota".into(),
@@ -473,7 +518,7 @@ fn window_name(window: &Value, fallback: &str) -> String {
                 .map(|seconds| seconds / 60.0)
         });
     match minutes {
-        Some(value) if value >= 7.0 * 1440.0 - 60.0 => "7d".into(),
+        Some(value) if (7.0 * 1440.0 - 60.0..=7.0 * 1440.0 + 60.0).contains(&value) => "7d".into(),
         Some(value) if value >= 60.0 => format!("{}h", (value / 60.0).round()),
         Some(value) => format!("{}m", value.round()),
         None => fallback.into(),
@@ -508,7 +553,16 @@ fn codex_windows(limits: &Value) -> Vec<CapacityLimit> {
         result.insert(limit.name.clone(), limit);
     }
     let mut result: Vec<_> = result.into_values().collect();
-    result.sort_by_key(|limit| if limit.name == "5h" { 0 } else { 1 });
+    result.sort_by(|left, right| {
+        let rank = |limit: &CapacityLimit| match limit.name.as_str() {
+            "5h" => 0,
+            "7d" => 1,
+            _ => 2,
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| left.name.cmp(&right.name))
+    });
     result
 }
 
@@ -885,10 +939,13 @@ fn collect_all(config: &Config, force: bool) -> Result<Vec<CapacityAccount>> {
         .refresh_seconds
         .unwrap_or(DEFAULT_REFRESH_SECONDS)
         .max(60);
-    Ok(configured_accounts(config)?
-        .iter()
-        .map(|spec| collect_account(spec, refresh, force))
-        .collect())
+    let (specs, mut accounts) = configured_accounts(config);
+    accounts.extend(
+        specs
+            .iter()
+            .map(|spec| collect_account(spec, refresh, force)),
+    );
+    Ok(accounts)
 }
 
 fn provider_name(provider: &str) -> &'static str {
@@ -896,7 +953,7 @@ fn provider_name(provider: &str) -> &'static str {
         "anthropic" => "CLAUDE",
         "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
-        _ => "UNKNOWN",
+        _ => "CONFIG",
     }
 }
 
@@ -984,6 +1041,12 @@ fn truncate_text(text: &str, width: usize) -> String {
     result
 }
 
+fn pad_text(text: &str, width: usize) -> String {
+    let text = truncate_text(text, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(padding))
+}
+
 fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: usize) -> String {
     let stale = if limit.status == LimitStatus::Stale {
         " ~"
@@ -996,16 +1059,14 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     ) {
         let summary = limit_summary(limit);
         let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-        let name = truncate_text(&limit.name, name_width);
-        return format!("{name:<name_width$} {summary}");
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
     if limit.unit == "usd" {
         let remaining = limit.remaining.unwrap_or(0.0);
         if compact {
             let summary = format!("${remaining:.2}{stale}");
             let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-            let name = truncate_text(&limit.name, name_width);
-            return format!("{name:<name_width$} {summary}");
+            return format!("{} {summary}", pad_text(&limit.name, name_width));
         }
         let color = if remaining < config.critical_usd.unwrap_or(5.0) {
             "\x1b[31m"
@@ -1014,9 +1075,11 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         } else {
             "\x1b[32m"
         };
+        let summary = format!("${remaining:.2} remaining{stale}");
+        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
         return format!(
-            "{:<12} {color}${remaining:.2}\x1b[0m remaining{stale}",
-            limit.name
+            "{} {color}${remaining:.2}\x1b[0m remaining{stale}",
+            pad_text(&limit.name, name_width)
         );
     }
     let Some(percent) = limit.remaining_percent else {
@@ -1024,8 +1087,12 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         return format!("{name} unknown");
     };
     if compact {
-        let name = truncate_text(&limit.name, width.saturating_sub(6).max(1));
-        return format!("{name} {:>3}%{stale}", percent.round());
+        let summary = format!("{:>3}%{stale}", percent.round());
+        let name = truncate_text(
+            &limit.name,
+            width.saturating_sub(summary.chars().count() + 1).max(1),
+        );
+        return format!("{name} {summary}");
     }
     let reset = format_reset(limit.resets_at);
     let reset = if reset.is_empty() {
@@ -1036,8 +1103,8 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     let fixed_width = 12 + 1 + 5 + stale.len() + reset.chars().count();
     let bar_width = width.saturating_sub(fixed_width).max(4);
     format!(
-        "{:<12} {} {:>3}%{stale}{reset}",
-        limit.name,
+        "{} {} {:>3}%{stale}{reset}",
+        pad_text(&limit.name, 12),
         render_bar(
             percent,
             bar_width,
@@ -1124,7 +1191,7 @@ fn agent_name(agent: &str) -> &'static str {
     }
 }
 
-fn render_agents(config: &Config, accounts: &[CapacityAccount]) -> Vec<String> {
+fn render_agents(config: &Config, accounts: &[CapacityAccount], width: usize) -> Vec<String> {
     let panes = herdr_panes();
     let mut lines = Vec::new();
     for pane in panes
@@ -1134,7 +1201,10 @@ fn render_agents(config: &Config, accounts: &[CapacityAccount]) -> Vec<String> {
         if lines.is_empty() {
             lines.extend([
                 "\x1b[1mAgents\x1b[0m".into(),
-                "\x1b[2m────────────────────────────────────────\x1b[0m".into(),
+                format!(
+                    "\x1b[2m{}\x1b[0m",
+                    "─".repeat(width.saturating_sub(1).max(1))
+                ),
             ]);
         }
         let label = if !pane.label.is_empty() {
@@ -1144,32 +1214,37 @@ fn render_agents(config: &Config, accounts: &[CapacityAccount]) -> Vec<String> {
         } else {
             agent_name(&pane.agent)
         };
-        lines.push(format!("● {label}"));
+        lines.push(truncate_text(&format!("● {label}"), width));
         let Some(binding) = resolve_binding(pane, config, accounts) else {
             let reason = if matches!(pane.agent.as_str(), "amp" | "ampcode") {
                 "dynamic route; configure a binding"
             } else {
                 "account unresolved"
             };
-            lines.push(format!(
-                "  \x1b[2m{} · {reason}\x1b[0m",
-                agent_name(&pane.agent)
-            ));
+            let detail = truncate_text(
+                &format!("{} · {reason}", agent_name(&pane.agent)),
+                width.saturating_sub(2),
+            );
+            lines.push(format!("  \x1b[2m{detail}\x1b[0m"));
             continue;
         };
         let Some(account) = accounts.iter().find(|account| {
             account.provider == binding.provider && account.account_id == binding.account_id
         }) else {
-            lines.push("  \x1b[2mconfigured account is unavailable\x1b[0m".into());
+            let detail =
+                truncate_text("configured account is unavailable", width.saturating_sub(2));
+            lines.push(format!("  \x1b[2m{detail}\x1b[0m"));
             continue;
         };
-        lines.push(format!(
-            "  {} · {}",
-            provider_name(&account.provider),
-            account.label
+        lines.push(truncate_text(
+            &format!("  {} · {}", provider_name(&account.provider), account.label),
+            width,
         ));
         if let Some(limit) = account.limits.first() {
-            lines.push(format!("  {} remaining", limit_summary(limit)));
+            lines.push(truncate_text(
+                &format!("  {} remaining", limit_summary(limit)),
+                width,
+            ));
         }
     }
     if !lines.is_empty() {
@@ -1206,7 +1281,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
         },
         String::new(),
     ];
-    for provider in ["anthropic", "openai", "openrouter"] {
+    for provider in ["invalid", "anthropic", "openai", "openrouter"] {
         let group: Vec<_> = accounts
             .iter()
             .filter(|account| account.provider == provider)
@@ -1267,7 +1342,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
     }
     if config.show_bindings && !compact {
         lines.push(String::new());
-        lines.extend(render_agents(config, accounts));
+        lines.extend(render_agents(config, accounts, width));
     }
     lines.join("\n").trim_end().into()
 }
@@ -1309,11 +1384,7 @@ fn read_key() -> Result<char> {
 
 fn pane_view(compact: bool) -> Result<()> {
     let config = load_config()?;
-    let interactive = Command::new("test")
-        .args(["-t", "0"])
-        .stdin(Stdio::inherit())
-        .status()
-        .is_ok_and(|status| status.success());
+    let interactive = io::stdin().is_terminal();
     let mut force = false;
     loop {
         let accounts = collect_all(&config, force)?;
@@ -1376,7 +1447,8 @@ mod tests {
     fn parses_codex_windows() {
         let limits = json!({
             "primary": {"window_minutes": 300, "used_percent": 37},
-            "secondary": {"window_minutes": 10080, "used_percent": 18}
+            "secondary": {"window_minutes": 10080, "used_percent": 18},
+            "secondary_window": {"window_minutes": 43200, "used_percent": 10}
         });
         let windows = codex_windows(&limits);
         assert_eq!(
@@ -1384,8 +1456,31 @@ mod tests {
                 .iter()
                 .map(|limit| (&limit.name, limit.remaining_percent))
                 .collect::<Vec<_>>(),
-            vec![(&"5h".into(), Some(63.0)), (&"7d".into(), Some(82.0))]
+            vec![
+                (&"5h".into(), Some(63.0)),
+                (&"7d".into(), Some(82.0)),
+                (&"720h".into(), Some(90.0))
+            ]
         );
+    }
+
+    #[test]
+    fn config_mistakes_become_unavailable_accounts() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [
+                {"provider": "anthropic", "accountId": "ok", "label": "OK"},
+                {"provider": "claude", "accountId": "typo", "label": "Typo"},
+                {"provider": "openai", "accountId": "", "label": "Empty"},
+                {"provider": "anthropic", "accountId": "ok", "label": "Duplicate"}
+            ]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(errors.len(), 3);
+        assert!(errors
+            .iter()
+            .all(|account| account.limits[0].status == LimitStatus::Unavailable));
     }
 
     #[test]
@@ -1404,6 +1499,51 @@ mod tests {
         let accounts = vec![test_account("personal", "個人 subscription", 28.0)];
         let output = render(&Config::default(), &accounts, false, 4);
         assert!(output.lines().all(|line| UnicodeWidthStr::width(line) <= 4));
+    }
+
+    #[test]
+    fn every_limit_branch_stays_within_the_pane_width() {
+        let mut account = test_account("personal", "Personal", 28.0);
+        account.limits = vec![
+            CapacityLimit {
+                name: "7d · A very long model display name".into(),
+                status: LimitStatus::Stale,
+                ..quota_limit("unused", Some(28.0), None)
+            },
+            CapacityLimit {
+                name: "A very long API credit balance name".into(),
+                kind: "credits".into(),
+                unit: "usd".into(),
+                remaining: Some(12.34),
+                total: None,
+                remaining_percent: None,
+                resets_at: None,
+                status: LimitStatus::Stale,
+                detail: String::new(),
+            },
+            CapacityLimit {
+                name: "A very long unknown capacity name".into(),
+                kind: "quota".into(),
+                unit: "percent".into(),
+                remaining: None,
+                total: None,
+                remaining_percent: None,
+                resets_at: None,
+                status: LimitStatus::Unknown,
+                detail: String::new(),
+            },
+        ];
+        for width in 20..=60 {
+            let output = render(
+                &Config::default(),
+                std::slice::from_ref(&account),
+                false,
+                width,
+            );
+            assert!(output
+                .lines()
+                .all(|line| UnicodeWidthStr::width(strip_ansi(line).as_str()) <= width));
+        }
     }
 
     #[test]
@@ -1522,5 +1662,22 @@ mod tests {
             management_key_env: None,
             pi_auth_path: None,
         }
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut result = String::new();
+        let mut characters = text.chars();
+        while let Some(character) = characters.next() {
+            if character == '\u{1b}' {
+                for character in characters.by_ref() {
+                    if character.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                result.push(character);
+            }
+        }
+        result
     }
 }

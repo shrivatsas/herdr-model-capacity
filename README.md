@@ -23,6 +23,86 @@ Configured accounts remain visible when collection fails. A previous successful
 value is marked stale; an account with no cached value is shown as unavailable.
 Unknown and unsupported capacity is never rendered as zero.
 
+## Architecture
+
+Herdr owns the pane lifecycle, the explicit registry owns account identity, and
+each provider's own CLI or credential store owns authentication. The plugin only
+normalizes and renders.
+
+```mermaid
+flowchart TD
+    A["<b>Herdr host</b><br/>actions · panes · keybindings"]
+
+    A -->|"open-capacity action"| B["<b>bin/open-capacity.sh</b><br/>per-workspace toggle<br/>state file + lock dir"]
+    B -->|"plugin pane open / close"| A
+    A -->|"pane entrypoint"| C["bin/run-capacity.sh"]
+    C --> D["<b>bin/model-capacity</b><br/>Rust binary"]
+
+    R["<b>model-capacity.json</b><br/>explicit account registry<br/>+ optional agent bindings"] --> D
+    D <--> S["<b>plugin state dir</b><br/>account-&lt;sha256&gt;.json<br/>normalized cards, no secrets"]
+
+    D --> E{"per account:<br/><b>provider</b>"}
+    E -->|anthropic| F["Claude Code OAuth credential<br/>or macOS Keychain secretRef<br/>→ api.anthropic.com/api/oauth/usage"]
+    E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
+    E -->|openrouter| H["openrouter.ai<br/>/api/v1/key or /api/v1/credits<br/>key named by env var"]
+
+    F --> J
+    G --> J
+    H --> J["<b>normalize</b> → CapacityLimit<br/>quota percent · USD balance<br/>reset time · status"]
+
+    J --> K["<b>render</b><br/>group by provider<br/>truncate to pane width"]
+    K --> A
+```
+
+Credentials never enter the registry or the state cache. The registry holds
+labels, config/home paths, environment-variable *names*, and Keychain
+service/account *references* only.
+
+## Refresh flow
+
+Each account is collected independently, and a failure degrades that one card
+rather than the pane.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Pane process
+    participant C as State cache
+    participant X as Provider collector
+    participant S as Provider / CLI
+
+    P->>P: load model-capacity.json,<br/>validate + de-duplicate accounts
+
+    loop each configured account
+        P->>C: read cache keyed by sha256 of provider + accountId
+        C-->>P: cached card + collector fingerprint
+
+        alt fingerprint matches and age under refreshSeconds
+            Note over P,C: reuse cached card, no network or CLI call
+        else expired, fingerprint changed, or forced by [r]
+            P->>X: collect(spec)
+            X->>S: OAuth usage · rateLimits · credits
+            alt success
+                S-->>X: provider payload
+                X-->>P: normalized limits
+                P->>C: atomic write (tmp file + rename)
+            else failure or timeout
+                S-->>X: error
+                X-->>P: error
+                Note over P: previous value → stale (~)<br/>no previous value → unavailable ⚠<br/>never rendered as zero
+            end
+        end
+    end
+
+    P->>P: render grouped by provider, fit to terminal width
+    Note over P: interactive pane — [r] forces a refresh<br/>any other key closes<br/>non-interactive mode prints once
+```
+
+The `collectorFingerprint` covers every input that changes what a collector
+reads — config dir, `CODEX_HOME`, env-var names, Keychain reference — so editing
+the registry invalidates that account's cache instead of showing a value
+collected from a different source.
+
 ## Install and open
 
 Requires Herdr 0.8.0 or newer, Rust/Cargo to build, and Python 3 for pane

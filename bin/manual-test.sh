@@ -211,4 +211,4 @@ Opening all-provider preview at width $WIDTH.
 Press r to force a refresh; press any other key to close.
 
 EOF
-COLUMNS="$WIDTH" "$ROOT/bin/model-capacity" pane
+MODEL_CAPACITY_WIDTH="$WIDTH" "$ROOT/bin/model-capacity" pane

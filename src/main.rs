@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
@@ -300,6 +302,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
 
 fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccount>) {
     let mut seen = HashSet::new();
+    let mut amp_configured = false;
     let mut result = Vec::new();
     let mut errors = Vec::new();
     for mut account in config.accounts.clone() {
@@ -326,6 +329,23 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
             );
             errors.push(unavailable_account(&account, detail));
             continue;
+        }
+        if account.provider == "amp" {
+            if account.amp_settings_path.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "ampSettingsPath cannot select an Amp identity and is not supported".into(),
+                ));
+                continue;
+            }
+            if amp_configured {
+                errors.push(unavailable_account(
+                    &account,
+                    "only one Amp account can be configured because Amp CLI exposes one authenticated identity".into(),
+                ));
+                continue;
+            }
+            amp_configured = true;
         }
         result.push(account);
     }
@@ -1035,6 +1055,20 @@ fn read_pipe(mut pipe: impl Read + Send + 'static) -> Receiver<io::Result<Vec<u8
     receiver
 }
 
+fn command_diagnostic(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    truncate_text(&text.split_whitespace().collect::<Vec<_>>().join(" "), 300)
+}
+
 fn stop_running_command(child: &mut Child) {
     #[cfg(unix)]
     unsafe {
@@ -1095,24 +1129,22 @@ fn command_stdout_with_timeout(
             .map_err(anyhow::Error::from)
     };
     let stdout = receive(&stdout)?;
-    receive(&stderr)?;
+    let stderr = receive(&stderr)?;
     if !status.success() {
-        return Err(anyhow!("command failed with status {status}"));
+        let diagnostic = command_diagnostic(&stderr);
+        return if diagnostic.is_empty() {
+            Err(anyhow!("command failed with status {status}"))
+        } else {
+            Err(anyhow!("command failed with status {status}: {diagnostic}"))
+        };
     }
     Ok(stdout)
 }
 
-fn collect_amp(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
-    let mut args = Vec::new();
-    if let Some(path) = &spec.amp_settings_path {
-        args.extend([
-            "--settings-file".into(),
-            expand_home(path).to_string_lossy().into_owned(),
-        ]);
-    }
-    args.push("usage".into());
-    let stdout = command_stdout_with_timeout(Path::new("amp"), &args, AMP_USAGE_TIMEOUT)
-        .context("run official amp usage command")?;
+fn collect_amp(_spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
+    let stdout =
+        command_stdout_with_timeout(Path::new("amp"), &["usage".into()], AMP_USAGE_TIMEOUT)
+            .context("run official amp usage command")?;
     let output = String::from_utf8(stdout).context("amp usage output is not UTF-8")?;
     parse_amp_usage_at(&output, Utc::now())
 }
@@ -1144,7 +1176,7 @@ fn collector_fingerprint(spec: &AccountSpec) -> String {
         })
         .unwrap_or_default();
     let material = format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         spec.provider,
         spec.auth_type,
         spec.source,
@@ -1162,11 +1194,6 @@ fn collector_fingerprint(spec: &AccountSpec) -> String {
         spec.token_env.as_deref().unwrap_or_default(),
         spec.management_key_env.as_deref().unwrap_or_default(),
         spec.pi_auth_path
-            .as_ref()
-            .map(expand_home)
-            .unwrap_or_default()
-            .display(),
-        spec.amp_settings_path
             .as_ref()
             .map(expand_home)
             .unwrap_or_default()
@@ -1382,25 +1409,7 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
     if limit.unit == "usd" {
-        let remaining = limit.remaining.unwrap_or(0.0);
-        if compact {
-            let summary = format!("${remaining:.2}{stale}");
-            let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-            return format!("{} {summary}", pad_text(&limit.name, name_width));
-        }
-        let color = if remaining < config.critical_usd.unwrap_or(5.0) {
-            "\x1b[31m"
-        } else if remaining < config.warning_usd.unwrap_or(10.0) {
-            "\x1b[33m"
-        } else {
-            "\x1b[32m"
-        };
-        let summary = format!("${remaining:.2} remaining{stale}");
-        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-        return format!(
-            "{} {color}${remaining:.2}\x1b[0m remaining{stale}",
-            pad_text(&limit.name, name_width)
-        );
+        return render_money_limit(limit, config, compact, true, width);
     }
     let Some(percent) = limit.remaining_percent else {
         let name = truncate_text(&limit.name, width.saturating_sub(8).max(1));
@@ -1432,6 +1441,41 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
             config.critical_percent.unwrap_or(10.0)
         ),
         percent.round()
+    )
+}
+
+fn render_money_limit(
+    limit: &CapacityLimit,
+    config: &Config,
+    compact: bool,
+    include_remaining: bool,
+    width: usize,
+) -> String {
+    let remaining = limit.remaining.unwrap_or(0.0);
+    let stale = if limit.status == LimitStatus::Stale {
+        " ~"
+    } else {
+        ""
+    };
+    let suffix = if include_remaining { " remaining" } else { "" };
+    let summary = format!("${remaining:.2}{suffix}{stale}");
+    if UnicodeWidthStr::width(summary.as_str()) + 2 > width {
+        return truncate_text(&summary, width);
+    }
+    let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+    if compact {
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
+    }
+    let color = if remaining < config.critical_usd.unwrap_or(5.0) {
+        "\x1b[31m"
+    } else if remaining < config.warning_usd.unwrap_or(10.0) {
+        "\x1b[33m"
+    } else {
+        "\x1b[32m"
+    };
+    format!(
+        "{} {color}${remaining:.2}\x1b[0m{suffix}{stale}",
+        pad_text(&limit.name, name_width)
     )
 }
 
@@ -1480,15 +1524,12 @@ fn render_amp_limits(
         if rendered.name == "Individual credits" {
             rendered.name = "Available Credits".into();
         }
-        lines.push(format!(
-            "  {}",
-            render_limit(
-                &rendered,
-                config,
-                compact || rendered.name == "Available Credits",
-                width.saturating_sub(2)
-            )
-        ));
+        let rendered_line = if rendered.name == "Available Credits" {
+            render_money_limit(&rendered, config, compact, false, width.saturating_sub(2))
+        } else {
+            render_limit(&rendered, config, compact, width.saturating_sub(2))
+        };
+        lines.push(format!("  {rendered_line}"));
         if !compact && !rendered.detail.is_empty() {
             lines.push(format!(
                 "  \x1b[2m{}\x1b[0m",
@@ -1737,32 +1778,32 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
 }
 
 fn terminal_width() -> usize {
-    if let Some(width) = env::var("COLUMNS")
+    if let Some(width) = env::var("MODEL_CAPACITY_WIDTH")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|width: &usize| *width > 0)
     {
         return width;
     }
-    if let Ok(tty) = fs::File::open("/dev/tty") {
-        if let Ok(output) = Command::new("stty")
-            .arg("size")
-            .stdin(Stdio::from(tty))
-            .output()
+    #[cfg(unix)]
+    {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
+            && size.ws_col > 0
         {
-            if output.status.success() {
-                if let Some(width) = String::from_utf8_lossy(&output.stdout)
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|width| *width > 0)
-                {
-                    return width;
-                }
-            }
+            return usize::from(size.ws_col);
         }
     }
-    20
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|width: &usize| *width > 0)
+        .unwrap_or(80)
 }
 
 fn read_key() -> Result<char> {
@@ -2007,6 +2048,23 @@ mod tests {
         assert!(started.elapsed() < StdDuration::from_millis(500));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn command_failure_includes_sanitized_stderr() {
+        let error = command_stdout_with_timeout(
+            Path::new("sh"),
+            &[
+                "-c".into(),
+                "printf 'not signed in; run amp login\\n' >&2; exit 1".into(),
+            ],
+            StdDuration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not signed in; run amp login"));
+        assert!(!error.contains('\n'));
+    }
+
     #[test]
     fn config_mistakes_become_unavailable_accounts() {
         let config: Config = serde_json::from_value(json!({
@@ -2024,6 +2082,32 @@ mod tests {
         assert!(errors
             .iter()
             .all(|account| account.limits[0].status == LimitStatus::Unavailable));
+    }
+
+    #[test]
+    fn rejects_ambiguous_amp_account_configuration() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [
+                {"provider": "amp", "accountId": "default", "label": "AMP"},
+                {"provider": "amp", "accountId": "work", "label": "Work AMP"},
+                {
+                    "provider": "amp",
+                    "accountId": "settings",
+                    "label": "Settings AMP",
+                    "ampSettingsPath": "/tmp/amp-settings.json"
+                }
+            ]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|account| account
+            .error
+            .contains("only one Amp account can be configured")));
+        assert!(errors
+            .iter()
+            .any(|account| account.error.contains("ampSettingsPath")));
     }
 
     #[test]
@@ -2088,6 +2172,16 @@ mod tests {
         assert!(!output.contains("renewal reported"));
         assert!(!output.contains("$25.64 remaining"));
         assert_eq!(output.matches("renewal in").count(), 1);
+        let warning_output = render(
+            &Config {
+                critical_usd: Some(30.0),
+                ..Config::default()
+            },
+            std::slice::from_ref(&account),
+            false,
+            80,
+        );
+        assert!(warning_output.contains("\x1b[31m$25.64\x1b[0m"));
     }
 
     #[test]
@@ -2167,9 +2261,13 @@ mod tests {
                 false,
                 width,
             );
-            assert!(output
-                .lines()
-                .all(|line| UnicodeWidthStr::width(strip_ansi(line).as_str()) <= width));
+            for line in output.lines() {
+                let line = strip_ansi(line);
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= width,
+                    "line exceeds width {width}: {line:?}"
+                );
+            }
         }
     }
 

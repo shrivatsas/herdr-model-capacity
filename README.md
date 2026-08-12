@@ -45,7 +45,7 @@ flowchart TD
     E -->|anthropic| F["Claude Code OAuth credential<br/>or macOS Keychain secretRef<br/>→ api.anthropic.com/api/oauth/usage"]
     E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
     E -->|openrouter| H["openrouter.ai<br/>/api/v1/key or /api/v1/credits<br/>key named by env var"]
-    E -->|amp| I["<b>amp usage</b><br/>optional --settings-file<br/>version-1 text parser"]
+    E -->|amp| I["<b>amp usage</b><br/>single CLI identity<br/>version-1 text parser"]
 
     F --> J
     G --> J
@@ -299,13 +299,12 @@ reports a number of days; “resets daily” is retained as detail without inven
 an exact timestamp. Identity lines and trailing CLI advice are ignored, and the
 registry's `accountId` and `label` remain authoritative.
 
-For multiple CLI identities, set the optional non-secret `ampSettingsPath` on
-each account. It is passed to Amp as `--settings-file`; credentials remain in
-Amp-owned storage. A missing CLI, signed-out identity, timeout, command error, or
-unrecognized capacity text makes a never-fetched card unavailable and retains a
-previous successful value as stale—never as zero. Because `amp usage` is a
-human-readable, versioned text contract, a future CLI wording change may require
-a parser update.
+Amp CLI currently exposes one authenticated identity to `amp usage`, so only one
+Amp billing account may be configured. A missing CLI, signed-out identity,
+timeout, command error, or unrecognized capacity text makes a never-fetched card
+unavailable and retains a previous successful value as stale—never as zero.
+Because `amp usage` is a human-readable, versioned text contract, a future CLI
+wording change may require a parser update.
 
 ## Security model
 

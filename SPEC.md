@@ -633,9 +633,9 @@ This is separate from an Amp billing account with `provider: "amp"`.
 
 Amp capacity is collected only through official authenticated `amp usage`, with
 `NO_COLOR=1`, null stdin, and a bounded overall timeout. Amp CLI owns all
-authentication. An optional `ampSettingsPath` supports multiple CLI identities
-by passing the non-secret path through `--settings-file`; the registry never
-stores credentials and parsed identity text never supplies the account label.
+authentication and currently exposes one authenticated identity to `amp usage`,
+so the registry accepts only one Amp billing account. The registry never stores
+credentials and parsed identity text never supplies the account label.
 The version-1 text parser normalizes Amp Free dollar and daily-percent forms,
 subscription other/orb lanes, individual credits, and every reported workspace
 balance. Renewal resets are approximate and are derived only from a reported

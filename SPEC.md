@@ -1,5 +1,15 @@
 # Model Capacity design specification
 
+> **Implementation note:** The original brief below records the initial research
+> direction. The shipped v1 decisions are narrower: the explicit account
+> registry is authoritative; the normal pane is account-only; agent linkage is
+> optional and disabled by default; ChatGPT quota is collected only through
+> `codex app-server --stdio` for each configured `CODEX_HOME`; and Claude
+> setup-token credentials referenced through macOS Keychain are shown as
+> quota-unsupported because the OAuth usage endpoint rejects that credential
+> type. The persistent pane defaults to a right split and can be replaced with a
+> down split. README.md is the normative setup and security documentation.
+
 ## Goal
 
 Add a lightweight Herdr view answering:

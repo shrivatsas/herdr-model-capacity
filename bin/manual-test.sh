@@ -19,7 +19,9 @@ Creates a four-provider test registry with agent bindings disabled.
   -h, --help        Show this help
 
 The registry references existing CLI logins and OPENROUTER_API_KEY; it never
-copies credentials. Providers without usable credentials render unavailable.
+copies credentials. Claude and Codex account homes under ~/.claude-accounts and
+~/.codex-accounts are included automatically. Providers without usable
+credentials render unavailable.
 EOF
 }
 
@@ -58,56 +60,94 @@ done
   exit 2
 }
 
-command -v cargo >/dev/null 2>&1 || {
-  echo "manual-test: Rust/Cargo is required" >&2
-  exit 127
-}
+for command in cargo python3; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "manual-test: $command is required" >&2
+    exit 127
+  }
+done
 
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herdr-capacity-manual.XXXXXX")"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 CONFIG="$TEMP_DIR/model-capacity.json"
 STATE_DIR="$TEMP_DIR/state"
 
-cat >"$CONFIG" <<'JSON'
-{
-  "refreshSeconds": 180,
-  "showBindings": false,
-  "accounts": [
-    {
-      "provider": "anthropic",
-      "accountId": "claude-default",
-      "label": "Claude subscription",
-      "authType": "oauth",
-      "source": "claude-code",
-      "configDir": "~/.claude",
-      "allowKeychain": true
-    },
-    {
-      "provider": "openai",
-      "accountId": "codex-default",
-      "label": "ChatGPT subscription",
-      "authType": "oauth",
-      "source": "codex",
-      "codexHome": "~/.codex"
-    },
-    {
-      "provider": "openrouter",
-      "accountId": "openrouter-default",
-      "label": "OpenRouter",
-      "authType": "api",
-      "source": "openrouter",
-      "tokenEnv": "OPENROUTER_API_KEY"
-    },
-    {
-      "provider": "amp",
-      "accountId": "amp-default",
-      "label": "Amp billing",
-      "authType": "cli",
-      "source": "amp-cli"
+python3 - "$CONFIG" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+
+home = pathlib.Path.home()
+
+def account_homes(directory, fallback):
+    homes = sorted(path for path in directory.glob("*") if path.is_dir())
+    return homes or [fallback]
+
+def identifier(value):
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "default"
+
+def display_name(path):
+    return "default" if path.name.startswith(".") else path.name.replace("-", " ")
+
+accounts = []
+keychain_account_added = False
+for path in account_homes(home / ".claude-accounts", home / ".claude"):
+    name = display_name(path)
+    account = {
+        "provider": "anthropic",
+        "accountId": f"claude-{identifier(name)}",
+        "label": f"Claude {name}",
+        "authType": "oauth",
+        "source": "claude-code",
     }
-  ]
-}
-JSON
+    if (path / ".credentials.json").is_file():
+        account["configDir"] = os.fspath(path)
+    elif not keychain_account_added:
+        account["allowKeychain"] = True
+        keychain_account_added = True
+    else:
+        account["configDir"] = os.fspath(path)
+    accounts.append(account)
+
+for path in account_homes(home / ".codex-accounts", home / ".codex"):
+    name = display_name(path)
+    accounts.append({
+        "provider": "openai",
+        "accountId": f"chatgpt-{identifier(name)}",
+        "label": f"ChatGPT {name}",
+        "authType": "oauth",
+        "source": "codex",
+        "codexHome": os.fspath(path),
+    })
+
+accounts.extend([
+    {
+        "provider": "openrouter",
+        "accountId": "openrouter-default",
+        "label": "OpenRouter",
+        "authType": "api",
+        "source": "openrouter",
+        "tokenEnv": "OPENROUTER_API_KEY",
+    },
+    {
+        "provider": "amp",
+        "accountId": "amp-default",
+        "label": "AMP billing",
+        "authType": "cli",
+        "source": "amp-cli",
+    },
+])
+
+with open(sys.argv[1], "w") as output:
+    json.dump({
+        "refreshSeconds": 180,
+        "showBindings": False,
+        "accounts": accounts,
+    }, output, indent=2)
+    output.write("\n")
+PY
 
 echo "Building model-capacity..." >&2
 bash "$ROOT/bin/build.sh"

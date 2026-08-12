@@ -345,7 +345,10 @@ bash bin/manual-test.sh
 ```
 
 Use `--probe` for normalized JSON or `--herdr` to back up the current plugin
-registry, install the four-provider test registry, and link this checkout.
+registry, install the four-provider test registry, and link this checkout. The
+script includes each account home under `~/.claude-accounts` and
+`~/.codex-accounts`; `~/.claude` and `~/.codex` are used only when their account
+directories are absent.
 
 The original implementation brief and research notes are in [SPEC.md](SPEC.md).
 

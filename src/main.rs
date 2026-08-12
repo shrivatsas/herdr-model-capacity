@@ -965,7 +965,10 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             else {
                 continue;
             };
-            for (lane, percent) in [("other", other), ("orb", orb)] {
+            for (lane, percent, detail) in [
+                ("other", other, format!("renewal reported in {days} days")),
+                ("orb", orb, String::new()),
+            ] {
                 limits.push(CapacityLimit {
                     name: format!("{plan} · {lane}"),
                     kind: "quota".into(),
@@ -975,7 +978,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
                     remaining_percent: Some(percent),
                     resets_at: Some(reset),
                     status: LimitStatus::Ok,
-                    detail: format!("renewal reported in {days} days"),
+                    detail,
                 });
             }
             parsed_lines += 1;
@@ -1436,6 +1439,71 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     )
 }
 
+fn render_amp_limits(
+    limits: &[CapacityLimit],
+    config: &Config,
+    compact: bool,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < limits.len() {
+        let limit = &limits[index];
+        let subscription = limit.name.strip_suffix(" · other").filter(|plan| {
+            limits
+                .get(index + 1)
+                .is_some_and(|next| next.name == format!("{plan} · orb"))
+        });
+        if !compact {
+            if let Some(plan) = subscription {
+                let renewal = limit
+                    .detail
+                    .strip_prefix("renewal reported in ")
+                    .map(|value| format!(" [renewal in {value}]"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  \x1b[1m{}\x1b[0m",
+                    truncate_text(&format!("{plan}{renewal}"), width.saturating_sub(2))
+                ));
+                for (lane, name) in [(&limits[index], "Other"), (&limits[index + 1], "Orbs")] {
+                    let mut lane = lane.clone();
+                    lane.name = name.into();
+                    lane.resets_at = None;
+                    lane.detail.clear();
+                    lines.push(format!(
+                        "    {}",
+                        render_limit(&lane, config, false, width.saturating_sub(4))
+                    ));
+                }
+                index += 2;
+                continue;
+            }
+        }
+
+        let mut rendered = limit.clone();
+        if rendered.name == "Individual credits" {
+            rendered.name = "Available Credits".into();
+        }
+        lines.push(format!(
+            "  {}",
+            render_limit(
+                &rendered,
+                config,
+                compact || rendered.name == "Available Credits",
+                width.saturating_sub(2)
+            )
+        ));
+        if !compact && !rendered.detail.is_empty() {
+            lines.push(format!(
+                "  \x1b[2m{}\x1b[0m",
+                truncate_text(&rendered.detail, width.saturating_sub(2))
+            ));
+        }
+        index += 1;
+    }
+    lines
+}
+
 fn herdr_panes() -> Vec<Pane> {
     let Ok(output) = Command::new("herdr").args(["pane", "list"]).output() else {
         return Vec::new();
@@ -1634,16 +1702,20 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
             ));
-            for limit in &account.limits {
-                lines.push(format!(
-                    "  {}",
-                    render_limit(limit, config, compact, width.saturating_sub(2))
-                ));
-                if !compact && !limit.detail.is_empty() {
+            if account.provider == "amp" {
+                lines.extend(render_amp_limits(&account.limits, config, compact, width));
+            } else {
+                for limit in &account.limits {
                     lines.push(format!(
-                        "  \x1b[2m{}\x1b[0m",
-                        truncate_text(&limit.detail, width.saturating_sub(2))
+                        "  {}",
+                        render_limit(limit, config, compact, width.saturating_sub(2))
                     ));
+                    if !compact && !limit.detail.is_empty() {
+                        lines.push(format!(
+                            "  \x1b[2m{}\x1b[0m",
+                            truncate_text(&limit.detail, width.saturating_sub(2))
+                        ));
+                    }
                 }
             }
             if !compact && !account.error.is_empty() {
@@ -1832,6 +1904,13 @@ mod tests {
         assert!(limits
             .iter()
             .all(|limit| limit.resets_at == Some(now + Duration::days(29))));
+        assert_eq!(
+            limits
+                .iter()
+                .filter(|limit| limit.detail == "renewal reported in 29 days")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1965,12 +2044,19 @@ mod tests {
 
     #[test]
     fn renders_amp_cards_in_narrow_and_wide_layouts() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut limits =
+            parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
+                .unwrap();
+        limits.push(money_limit("Individual credits", 25.64, None));
         let account = CapacityAccount {
             provider: "amp".into(),
             account_id: "billing".into(),
-            label: "Amp billing".into(),
+            label: "AMP billing".into(),
             auth_type: "cli".into(),
-            limits: vec![money_limit("Individual credits", 25.64, None)],
+            limits,
             fetched_at: Utc::now(),
             error: String::new(),
             collector_fingerprint: String::new(),
@@ -1983,9 +2069,23 @@ mod tests {
                 width,
             );
             assert!(output.contains("AMP"));
-            assert!(output.contains("Amp billing"));
+            assert!(output.contains("AMP billing"));
             assert!(output.contains("$25.64"));
         }
+        let output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            false,
+            80,
+        ));
+        assert!(output.contains("Megawatt [renewal in 29 days]"));
+        assert!(output.contains("Other"));
+        assert!(output.contains("Orbs"));
+        assert!(output.contains("Available Credits"));
+        assert!(!output.contains("Individual credits"));
+        assert!(!output.contains("renewal reported"));
+        assert!(!output.contains("$25.64 remaining"));
+        assert_eq!(output.matches("renewal in").count(), 1);
     }
 
     #[test]

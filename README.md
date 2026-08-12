@@ -337,6 +337,16 @@ cargo clippy --all-targets -- -D warnings
 bash -n bin/*.sh
 ```
 
+For a manual smoke test with one explicit account card for every provider and
+agent bindings hidden, run:
+
+```bash
+bash bin/manual-test.sh
+```
+
+Use `--probe` for normalized JSON or `--herdr` to back up the current plugin
+registry, install the four-provider test registry, and link this checkout.
+
 The original implementation brief and research notes are in [SPEC.md](SPEC.md).
 
 ## License

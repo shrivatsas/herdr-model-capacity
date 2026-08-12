@@ -888,6 +888,18 @@ fn amp_metadata_line(line: &str) -> bool {
         || line.starts_with("http://")
 }
 
+fn amp_signed_out_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "not signed in",
+        "not logged in",
+        "run amp login",
+        "sign in to amp",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn valid_amp_advice_suffix(suffix: &str) -> bool {
     suffix.is_empty()
         || ((suffix.starts_with(" (") || suffix.starts_with(" - "))
@@ -899,23 +911,16 @@ fn valid_amp_name(name: &str) -> bool {
 }
 
 fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLimit>> {
-    let lower = output.to_ascii_lowercase();
-    if [
-        "not signed in",
-        "not logged in",
-        "run amp login",
-        "sign in to amp",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return Err(anyhow!("Amp CLI is signed out"));
-    }
     let mut limits = Vec::new();
     let mut contract_lines = 0;
     let mut parsed_lines = 0;
+    let mut signed_out = false;
     for line in output.lines().map(str::trim) {
         if amp_metadata_line(line) {
+            continue;
+        }
+        if amp_signed_out_line(line) {
+            signed_out = true;
             continue;
         }
         contract_lines += 1;
@@ -969,19 +974,23 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             let Some((other, rest)) = rest.split_once("% other usage and ") else {
                 continue;
             };
-            let Some((orb, days)) = rest
-                .split_once("% orb usage remaining - resets upon renewal in ")
-                .and_then(|(orb, days)| Some((orb, days.strip_suffix(" days")?)))
+            let Some((orb, days)) =
+                rest.split_once("% orb usage remaining - resets upon renewal in ")
             else {
                 continue;
             };
+            let days = days
+                .strip_suffix(" days")
+                .or_else(|| days.strip_suffix(" day"));
             let (Some(other), Some(orb), Some(days)) = (
                 parse_amp_percent(other),
                 parse_amp_percent(orb),
-                days.bytes()
-                    .all(|c| c.is_ascii_digit())
-                    .then(|| days.parse::<i64>().ok())
-                    .flatten(),
+                days.and_then(|days| {
+                    days.bytes()
+                        .all(|c| c.is_ascii_digit())
+                        .then(|| days.parse::<i64>().ok())
+                        .flatten()
+                }),
             ) else {
                 continue;
             };
@@ -990,8 +999,13 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             else {
                 continue;
             };
+            let day_unit = if days == 1 { "day" } else { "days" };
             for (lane, percent, detail) in [
-                ("other", other, format!("renewal reported in {days} days")),
+                (
+                    "other",
+                    other,
+                    format!("renewal reported in {days} {day_unit}"),
+                ),
                 ("orb", orb, String::new()),
             ] {
                 limits.push(CapacityLimit {
@@ -1036,6 +1050,9 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
                 }
             }
         }
+    }
+    if limits.is_empty() && signed_out {
+        return Err(anyhow!("Amp CLI is signed out"));
     }
     if limits.is_empty() || parsed_lines != contract_lines {
         return Err(anyhow!(
@@ -1457,8 +1474,14 @@ fn render_money_limit(
     } else {
         ""
     };
-    let suffix = if include_remaining { " remaining" } else { "" };
-    let summary = format!("${remaining:.2}{suffix}{stale}");
+    let total = limit.total.map(|total| format!("/${total:.2}"));
+    let total = total.as_deref().unwrap_or_default();
+    let suffix = if include_remaining && !compact {
+        " remaining"
+    } else {
+        ""
+    };
+    let summary = format!("${remaining:.2}{total}{suffix}{stale}");
     if UnicodeWidthStr::width(summary.as_str()) + 2 > width {
         return truncate_text(&summary, width);
     }
@@ -1474,7 +1497,7 @@ fn render_money_limit(
         "\x1b[32m"
     };
     format!(
-        "{} {color}${remaining:.2}\x1b[0m{suffix}{stale}",
+        "{} {color}${remaining:.2}\x1b[0m{total}{suffix}{stale}",
         pad_text(&limit.name, name_width)
     )
 }
@@ -1494,8 +1517,8 @@ fn render_amp_limits(
                 .get(index + 1)
                 .is_some_and(|next| next.name == format!("{plan} · orb"))
         });
-        if !compact {
-            if let Some(plan) = subscription {
+        if let Some(plan) = subscription {
+            if !compact {
                 let renewal = limit
                     .detail
                     .strip_prefix("renewal reported in ")
@@ -1505,19 +1528,20 @@ fn render_amp_limits(
                     "  \x1b[1m{}\x1b[0m",
                     truncate_text(&format!("{plan}{renewal}"), width.saturating_sub(2))
                 ));
-                for (lane, name) in [(&limits[index], "Other"), (&limits[index + 1], "Orbs")] {
-                    let mut lane = lane.clone();
-                    lane.name = name.into();
-                    lane.resets_at = None;
-                    lane.detail.clear();
-                    lines.push(format!(
-                        "    {}",
-                        render_limit(&lane, config, false, width.saturating_sub(4))
-                    ));
-                }
-                index += 2;
-                continue;
             }
+            let indent = if compact { "  " } else { "    " };
+            for (lane, name) in [(&limits[index], "Other"), (&limits[index + 1], "Orbs")] {
+                let mut lane = lane.clone();
+                lane.name = name.into();
+                lane.resets_at = None;
+                lane.detail.clear();
+                lines.push(format!(
+                    "{indent}{}",
+                    render_limit(&lane, config, compact, width.saturating_sub(indent.len()))
+                ));
+            }
+            index += 2;
+            continue;
         }
 
         let mut rendered = limit.clone();
@@ -1787,23 +1811,30 @@ fn terminal_width() -> usize {
     }
     #[cfg(unix)]
     {
-        let mut size = libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+        let width = |fd| {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0)
+                .then(|| usize::from(size.ws_col))
         };
-        if unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
-            && size.ws_col > 0
-        {
-            return usize::from(size.ws_col);
+        if let Some(width) = width(io::stdout().as_raw_fd()) {
+            return width;
+        }
+        if let Ok(tty) = fs::File::open("/dev/tty") {
+            if let Some(width) = width(tty.as_raw_fd()) {
+                return width;
+            }
         }
     }
     env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|width: &usize| *width > 0)
-        .unwrap_or(80)
+        .unwrap_or(20)
 }
 
 fn read_key() -> Result<char> {
@@ -1957,6 +1988,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_singular_amp_subscription_renewal_day() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let limits = parse_amp_usage_at(
+            "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 1 day",
+            now,
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 2);
+        assert!(limits
+            .iter()
+            .all(|limit| limit.resets_at == Some(now + Duration::days(1))));
+        assert_eq!(limits[0].detail, "renewal reported in 1 day");
+    }
+
+    #[test]
     fn parses_amp_individual_and_multiple_workspace_balances() {
         let credits = parse_amp_usage_at(
             include_str!("../tests/fixtures/amp/credits.txt"),
@@ -1991,7 +2039,6 @@ mod tests {
     fn rejects_amp_signed_out_and_parse_drift_instead_of_returning_zero() {
         for output in [
             "You are not signed in. Run amp login.",
-            "You are not signed in.\nIndividual credits: $5.00 remaining",
             "Amp Free now has plenty remaining",
             "Individual credits: $5.00 remaining\nWorkspace changed format",
             "Amp Free: $4.71/$oops remaining (replenishes +$0.42/hour)",
@@ -2006,6 +2053,17 @@ mod tests {
         ] {
             assert!(parse_amp_usage_at(output, Utc::now()).is_err());
         }
+    }
+
+    #[test]
+    fn signed_in_amp_usage_can_include_login_advice() {
+        let limits = parse_amp_usage_at(
+            "Individual credits: $25.64 remaining\nRun amp login to switch accounts",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].remaining, Some(25.64));
     }
 
     #[cfg(unix)]
@@ -2148,15 +2206,17 @@ mod tests {
             collector_fingerprint: String::new(),
         };
         for width in [30, 80] {
-            let output = render(
+            let output = strip_ansi(&render(
                 &Config::default(),
                 std::slice::from_ref(&account),
                 false,
                 width,
-            );
+            ));
             assert!(output.contains("AMP"));
             assert!(output.contains("AMP billing"));
             assert!(output.contains("$25.64"));
+            assert!(output.contains("Other"));
+            assert!(output.contains("Orbs"));
         }
         let output = strip_ansi(&render(
             &Config::default(),
@@ -2182,6 +2242,24 @@ mod tests {
             80,
         );
         assert!(warning_output.contains("\x1b[31m$25.64\x1b[0m"));
+    }
+
+    #[test]
+    fn compact_money_keeps_its_name_and_amp_free_shows_its_cap() {
+        let credits = money_limit("API credits", 1234.56, None);
+        let compact = render_money_limit(&credits, &Config::default(), true, true, 18);
+        assert!(compact.contains("API"));
+        assert!(!compact.contains("remaining"));
+
+        let amp_free = amp_money_limit("Amp Free", "4.71", Some("10")).unwrap();
+        let wide = strip_ansi(&render_money_limit(
+            &amp_free,
+            &Config::default(),
+            false,
+            true,
+            80,
+        ));
+        assert!(wide.contains("$4.71/$10.00 remaining"));
     }
 
     #[test]

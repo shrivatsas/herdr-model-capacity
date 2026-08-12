@@ -311,8 +311,8 @@ wording change may require a parser update.
 - The registry stores labels, home/config paths, environment-variable names,
   and Keychain service/account references—never OAuth or setup-token values.
 - Codex app-server is the sole owner of Codex auth and refresh.
-- Amp CLI is the sole owner of Amp authentication; settings paths are stored,
-  but Amp credentials and raw identity output are not.
+- Amp CLI is the sole owner of Amp authentication; Amp credentials and raw
+  identity output are not stored.
 - Provider responses cached under the plugin state directory contain normalized
   limits and errors, not credentials.
 - Diagnostics do not include secret values.

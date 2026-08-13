@@ -421,6 +421,13 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
             amp_configured = true;
         }
         if account.provider == "openrouter" {
+            if account.secret_ref.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "secretRef is not valid for OpenRouter; use tokenSecretRef or managementSecretRef".into(),
+                ));
+                continue;
+            }
             let configured_sources = [
                 account.token_env.is_some(),
                 account.management_key_env.is_some(),
@@ -457,18 +464,7 @@ fn client() -> Result<&'static Client> {
 }
 
 fn get_json(url: &str, headers: HeaderMap) -> Result<Value> {
-    get_json_with_error_body(url, headers, true)
-}
-
-fn get_json_private(url: &str, headers: HeaderMap) -> Result<Value> {
-    get_json_with_error_body(url, headers, false)
-}
-
-fn get_json_with_error_body(
-    url: &str,
-    mut headers: HeaderMap,
-    include_error_body: bool,
-) -> Result<Value> {
+    let mut headers = headers;
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
         USER_AGENT,
@@ -481,16 +477,13 @@ fn get_json_with_error_body(
         .with_context(|| format!("GET {url}"))?;
     let status = response.status();
     if !status.is_success() {
-        if include_error_body {
-            let detail = response
-                .text()
-                .unwrap_or_default()
-                .chars()
-                .take(300)
-                .collect::<String>();
-            return Err(anyhow!("HTTP {}: {}", status.as_u16(), detail));
-        }
-        return Err(anyhow!("HTTP {}", status.as_u16()));
+        let detail = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), detail));
     }
     response.json().context("parse provider response")
 }
@@ -867,6 +860,11 @@ fn openrouter_credential_with(
     env_value: impl Fn(&str) -> Option<String>,
     secret_value: impl Fn(&SecretRef) -> Result<String>,
 ) -> Result<(OpenRouterScope, String)> {
+    if spec.secret_ref.is_some() {
+        return Err(anyhow!(
+            "secretRef is not valid for OpenRouter; use tokenSecretRef or managementSecretRef"
+        ));
+    }
     let configured_sources = [
         spec.token_env.is_some(),
         spec.management_key_env.is_some(),
@@ -937,29 +935,30 @@ fn parse_openrouter_key(data: &Value, expected: OpenRouterScope) -> Result<Colle
     let is_management = key
         .get("is_management_key")
         .and_then(Value::as_bool)
-        .ok_or_else(|| anyhow!("key response omitted is_management_key"))?;
-    let actual = if is_management {
-        OpenRouterScope::Management
-    } else {
-        OpenRouterScope::Key
-    };
-    if actual != expected {
-        return Err(anyhow!(match expected {
-            OpenRouterScope::Key => {
-                "configured ordinary OpenRouter credential is a management key; use managementKeyEnv or managementSecretRef"
-            }
-            OpenRouterScope::Management => {
-                "configured OpenRouter management credential is an ordinary API key; use tokenEnv or tokenSecretRef"
-            }
-        }));
+        .or_else(|| key.get("is_provisioning_key").and_then(Value::as_bool));
+    if let Some(is_management) = is_management {
+        let actual = if is_management {
+            OpenRouterScope::Management
+        } else {
+            OpenRouterScope::Key
+        };
+        if actual != expected {
+            return Err(anyhow!(match expected {
+                OpenRouterScope::Key => {
+                    "configured ordinary OpenRouter credential is a management key; use managementKeyEnv or managementSecretRef"
+                }
+                OpenRouterScope::Management => {
+                    "configured OpenRouter management credential is an ordinary API key; use tokenEnv or tokenSecretRef"
+                }
+            }));
+        }
     }
     let credential_label = key
         .get("label")
         .and_then(Value::as_str)
-        .filter(|label| !label.is_empty())
-        .ok_or_else(|| anyhow!("key response omitted safe label"))?
+        .unwrap_or_default()
         .to_owned();
-    if actual == OpenRouterScope::Management {
+    if expected == OpenRouterScope::Management {
         return Ok(CollectedCapacity {
             limits: Vec::new(),
             credential_label,
@@ -983,7 +982,7 @@ fn parse_openrouter_key(data: &Value, expected: OpenRouterScope) -> Result<Colle
     } else {
         CapacityLimit {
             name: "key spending limit".into(),
-            kind: "balance".into(),
+            kind: "unlimited".into(),
             unit: "usd".into(),
             remaining: None,
             total,
@@ -1027,7 +1026,11 @@ fn parse_openrouter_credits(data: &Value, credential_label: String) -> Result<Co
 
 fn collect_openrouter(spec: &AccountSpec) -> Result<CollectedCapacity> {
     let (scope, token) = openrouter_credential(spec)?;
-    collect_openrouter_with(scope, &token, get_json_private)
+    collect_openrouter_with(scope, &token, get_json)
+}
+
+fn redact_openrouter_error(error: anyhow::Error, token: &str) -> anyhow::Error {
+    anyhow!(format!("{error:#}").replace(token, "[redacted]"))
 }
 
 fn collect_openrouter_with(
@@ -1038,7 +1041,8 @@ fn collect_openrouter_with(
     let key_data = request(
         "https://openrouter.ai/api/v1/key",
         openrouter_headers(token)?,
-    )?;
+    )
+    .map_err(|error| redact_openrouter_error(error, token))?;
     let key = parse_openrouter_key(&key_data, scope)?;
     if scope == OpenRouterScope::Key {
         return Ok(key);
@@ -1046,7 +1050,8 @@ fn collect_openrouter_with(
     let credits = request(
         "https://openrouter.ai/api/v1/credits",
         openrouter_headers(token)?,
-    )?;
+    )
+    .map_err(|error| redact_openrouter_error(error, token))?;
     parse_openrouter_credits(&credits, key.credential_label)
 }
 
@@ -1668,11 +1673,15 @@ fn format_reset(reset: Option<DateTime<Utc>>) -> String {
 }
 
 fn limit_summary(limit: &CapacityLimit) -> String {
+    if limit.kind == "unlimited" {
+        return if limit.status == LimitStatus::Stale {
+            "unlimited ~".into()
+        } else {
+            "unlimited".into()
+        };
+    }
     match limit.status {
         LimitStatus::Unavailable => "unavailable ⚠".into(),
-        LimitStatus::Unknown if limit.detail.starts_with("key is valid and unlimited") => {
-            "unlimited".into()
-        }
         LimitStatus::Unknown => "unknown".into(),
         _ if limit.unit == "usd" && limit.remaining.is_some() => {
             format!("${:.2}", limit.remaining.unwrap())
@@ -1720,6 +1729,11 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     } else {
         ""
     };
+    if limit.kind == "unlimited" {
+        let summary = limit_summary(limit);
+        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
+    }
     if matches!(
         limit.status,
         LimitStatus::Unknown | LimitStatus::Unavailable
@@ -2079,21 +2093,23 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
             ));
-            let scope = capacity_scope_label(&account.capacity_scope);
-            if !scope.is_empty() {
-                lines.push(format!(
-                    "  \x1b[2m{}\x1b[0m",
-                    truncate_text(scope, width.saturating_sub(2))
-                ));
-            }
-            if !account.credential_label.is_empty() {
-                lines.push(format!(
-                    "  \x1b[2m{}\x1b[0m",
-                    truncate_text(
-                        &format!("key ID {}", account.credential_label),
-                        width.saturating_sub(2)
-                    )
-                ));
+            if !compact {
+                let scope = capacity_scope_label(&account.capacity_scope);
+                if !scope.is_empty() {
+                    lines.push(format!(
+                        "  \x1b[2m{}\x1b[0m",
+                        truncate_text(scope, width.saturating_sub(2))
+                    ));
+                }
+                if !account.credential_label.is_empty() {
+                    lines.push(format!(
+                        "  \x1b[2m{}\x1b[0m",
+                        truncate_text(
+                            &format!("key ID {}", account.credential_label),
+                            width.saturating_sub(2)
+                        )
+                    ));
+                }
             }
             if account.provider == "amp" {
                 lines.extend(render_amp_limits(&account.limits, config, compact, width));
@@ -2546,10 +2562,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unlimited.limits[0].status, LimitStatus::Unknown);
+        assert_eq!(unlimited.limits[0].kind, "unlimited");
+        assert_eq!(limit_summary(&unlimited.limits[0]), "unlimited");
         assert!(unlimited.limits[0]
             .detail
             .contains("key is valid and unlimited"));
         assert!(unlimited.limits[0].detail.contains("management key"));
+
+        let optional_metadata_absent = parse_openrouter_key(
+            &json!({"data": {"limit": 5.0, "limit_remaining": 4.0}}),
+            OpenRouterScope::Key,
+        )
+        .unwrap();
+        assert!(optional_metadata_absent.credential_label.is_empty());
+        assert_eq!(optional_metadata_absent.limits[0].remaining, Some(4.0));
     }
 
     #[test]
@@ -2577,17 +2603,24 @@ mod tests {
         assert_eq!(collected.capacity_scope, "account_credits");
         assert_eq!(collected.limits[0].name, "account credits");
         assert_eq!(collected.limits[0].remaining, Some(37.5));
+
+        let optional_metadata_absent =
+            parse_openrouter_key(&json!({"data": {}}), OpenRouterScope::Management).unwrap();
+        assert!(optional_metadata_absent.credential_label.is_empty());
+        assert_eq!(optional_metadata_absent.capacity_scope, "account_credits");
     }
 
     #[test]
     fn openrouter_rejects_invalid_keys_and_scope_mismatches_without_echoing_secrets() {
         let secret = "never-print-this-key";
         let error = collect_openrouter_with(OpenRouterScope::Key, secret, |_url, _headers| {
-            Err(anyhow!("HTTP 401: invalid key"))
+            Err(anyhow!("HTTP 401: invalid key {secret}"))
         })
         .unwrap_err()
         .to_string();
         assert!(error.contains("401"));
+        assert!(error.contains("invalid key"));
+        assert!(error.contains("[redacted]"));
         assert!(!error.contains(secret));
 
         let management_as_key = parse_openrouter_key(
@@ -2604,6 +2637,13 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(key_as_management.contains("ordinary API key"));
+        let deprecated_flag = parse_openrouter_key(
+            &json!({"data": {"is_provisioning_key": true}}),
+            OpenRouterScope::Key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(deprecated_flag.contains("is a management key"));
     }
 
     #[test]
@@ -2682,6 +2722,26 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].error.contains("exactly one OpenRouter"));
 
+        let generic_ref: Config = serde_json::from_value(json!({
+            "accounts": [{
+                "provider": "openrouter",
+                "accountId": "wrong-ref",
+                "label": "OpenRouter",
+                "secretRef": {
+                    "kind": "macos-keychain",
+                    "service": "capacity-openrouter",
+                    "account": "ordinary"
+                }
+            }]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&generic_ref);
+        assert!(specs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]
+            .error
+            .contains("secretRef is not valid for OpenRouter"));
+
         let mut first: AccountSpec = serde_json::from_value(json!({
             "provider": "openrouter",
             "accountId": "default",
@@ -2731,6 +2791,14 @@ mod tests {
         assert!(pane.contains("Personal OpenRouter"));
         assert!(pane.contains("OpenRouter key spending limit"));
         assert!(pane.contains("key ID sk-or-v1-…cafe"));
+        let compact = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            true,
+            30,
+        ));
+        assert!(!compact.contains("key ID"));
+        assert!(!compact.contains("OpenRouter key spending limit"));
         let probe = serde_json::to_value(account).unwrap();
         assert_eq!(probe["credentialLabel"], "sk-or-v1-…cafe");
         assert_eq!(probe["capacityScope"], "key_spending_limit");

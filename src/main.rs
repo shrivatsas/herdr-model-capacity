@@ -1622,14 +1622,6 @@ fn provider_color(provider: &str) -> &'static str {
     }
 }
 
-fn account_display_label(account: &CapacityAccount) -> String {
-    if account.credential_label.is_empty() {
-        account.label.clone()
-    } else {
-        format!("{} · {}", account.label, account.credential_label)
-    }
-}
-
 fn capacity_scope_label(scope: &str) -> &str {
     match scope {
         "key_spending_limit" => "OpenRouter key spending limit",
@@ -2037,7 +2029,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 .map(limit_summary)
                 .unwrap_or_else(|| "unknown".into());
             lines.push(truncate_text(
-                &format!("{} {summary}", account_display_label(account)),
+                &format!("{} {summary}", account.label),
                 width,
             ));
         }
@@ -2085,13 +2077,22 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
             let label_width = width.saturating_sub(if stale.is_empty() { 1 } else { 9 });
             lines.push(format!(
                 "\x1b[1m{}{stale}\x1b[0m",
-                truncate_text(&account_display_label(account), label_width)
+                truncate_text(&account.label, label_width)
             ));
             let scope = capacity_scope_label(&account.capacity_scope);
             if !scope.is_empty() {
                 lines.push(format!(
                     "  \x1b[2m{}\x1b[0m",
                     truncate_text(scope, width.saturating_sub(2))
+                ));
+            }
+            if !account.credential_label.is_empty() {
+                lines.push(format!(
+                    "  \x1b[2m{}\x1b[0m",
+                    truncate_text(
+                        &format!("key ID {}", account.credential_label),
+                        width.saturating_sub(2)
+                    )
                 ));
             }
             if account.provider == "amp" {
@@ -2727,8 +2728,9 @@ mod tests {
             false,
             80,
         ));
-        assert!(pane.contains("Personal OpenRouter · sk-or-v1-…cafe"));
+        assert!(pane.contains("Personal OpenRouter"));
         assert!(pane.contains("OpenRouter key spending limit"));
+        assert!(pane.contains("key ID sk-or-v1-…cafe"));
         let probe = serde_json::to_value(account).unwrap();
         assert_eq!(probe["credentialLabel"], "sk-or-v1-…cafe");
         assert_eq!(probe["capacityScope"], "key_spending_limit");

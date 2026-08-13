@@ -297,10 +297,11 @@ These credentials report different capacity:
   credential type and safe masked label, then `/api/v1/credits` to report
   **account-wide OpenRouter credits**.
 
-The configured account label and OpenRouter's safe masked `data.label` are both
-shown, so multiple keys remain distinguishable. The full credential is never
-shown or cached. A credential whose actual type does not match its configured
-field is rejected with a configuration error.
+The configured account label is the card heading; OpenRouter's safe masked
+`data.label` appears beneath it as a secondary key ID, so multiple keys remain
+distinguishable. The full credential is never shown or cached. A credential
+whose actual type does not match its configured field is rejected with a
+configuration error.
 
 On macOS, store a management key in Keychain without putting it in Herdr's
 launch environment. This command prompts for the key securely (`-w` must remain

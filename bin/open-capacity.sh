@@ -25,24 +25,66 @@ if [[ -z "$WORKSPACE" ]]; then
 fi
 
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-$HOME/.local/state/herdr-model-capacity}"
-WORKSPACE_KEY="$(printf '%s' "$WORKSPACE" | shasum -a 256 | awk '{print $1}')"
+WORKSPACE_KEY="$(printf '%s' "$WORKSPACE" | python3 -c '
+import hashlib, sys
+print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+')"
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/pane-$WORKSPACE_KEY"
-LOCK_DIR="$STATE_DIR/pane-$WORKSPACE_KEY.lock"
-while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-  LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+LOCK_FILE="$STATE_DIR/pane-$WORKSPACE_KEY.lock"
+LOCK_ATTEMPTS=50
+
+# An earlier release locked with a directory. ln(1) links *into* an existing
+# directory rather than failing, so retire a leftover one before acquiring.
+if [[ -d "$LOCK_FILE" ]]; then
+  LEGACY_PID="$(cat "$LOCK_FILE/pid" 2>/dev/null || true)"
+  if [[ "$LEGACY_PID" =~ ^[0-9]+$ ]] && kill -0 "$LEGACY_PID" 2>/dev/null; then
+    echo "model-capacity: another pane action is already running" >&2
+    exit 1
+  fi
+  LEGACY_LOCK="$LOCK_FILE.legacy.$$"
+  if mv "$LOCK_FILE" "$LEGACY_LOCK" 2>/dev/null; then
+    rm -rf "$LEGACY_LOCK"
+  fi
+fi
+
+# Hard-linking an already-written pid file into place is atomic and fails when
+# the lock exists, so the lock is never observable without its owner's pid.
+# A dead lock is reclaimed by renaming it away first: only one racer can win
+# that rename, so no process ever unlinks a lock another process just took.
+LOCK_TMP="$STATE_DIR/pane-$WORKSPACE_KEY.lock.$$"
+printf '%s\n' "$$" >"$LOCK_TMP"
+trap 'rm -f "$LOCK_TMP" 2>/dev/null || true' EXIT
+LOCK_ATTEMPT=0
+until ln "$LOCK_TMP" "$LOCK_FILE" 2>/dev/null; do
+  LOCK_PID="$(cat "$LOCK_FILE" 2>/dev/null || true)"
   if [[ "$LOCK_PID" =~ ^[0-9]+$ ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
     echo "model-capacity: another pane action is already running" >&2
     exit 1
   fi
-  STALE_LOCK="$LOCK_DIR.stale.$$"
-  if mv "$LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
-    rm -f "$STALE_LOCK/pid"
-    rmdir "$STALE_LOCK" 2>/dev/null || true
+  LOCK_ATTEMPT=$((LOCK_ATTEMPT + 1))
+  if (( LOCK_ATTEMPT > LOCK_ATTEMPTS )); then
+    echo "model-capacity: cannot acquire the pane lock at $LOCK_FILE" >&2
+    exit 1
   fi
+  STALE_LOCK="$LOCK_FILE.stale.$$"
+  if mv "$LOCK_FILE" "$STALE_LOCK" 2>/dev/null; then
+    STALE_PID="$(cat "$STALE_LOCK" 2>/dev/null || true)"
+    if [[ "$STALE_PID" =~ ^[0-9]+$ ]] && kill -0 "$STALE_PID" 2>/dev/null; then
+      # The owner wrote its pid between our read and the rename; put the lock
+      # back and let it finish.
+      ln "$STALE_LOCK" "$LOCK_FILE" 2>/dev/null || true
+      rm -rf "$STALE_LOCK"
+      echo "model-capacity: another pane action is already running" >&2
+      exit 1
+    fi
+    # rm -rf also clears a lock directory left by an older release.
+    rm -rf "$STALE_LOCK"
+  fi
+  sleep 0.1
 done
-printf '%s\n' "$$" >"$LOCK_DIR/pid"
-trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+trap 'rm -f "$LOCK_TMP" "$LOCK_FILE" 2>/dev/null || true' EXIT
+rm -f "$LOCK_TMP"
 
 # Refresh after taking the lock so a completed concurrent open cannot be
 # mistaken for stale state based on the pre-lock snapshot.

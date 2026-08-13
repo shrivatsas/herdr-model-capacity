@@ -9,11 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     mpsc::{self, Receiver},
-    OnceLock,
+    Arc, OnceLock,
 };
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -21,6 +25,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_REFRESH_SECONDS: i64 = 180;
+const AMP_USAGE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const AMP_USAGE_TEXT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +95,8 @@ struct AccountSpec {
     management_key_env: Option<String>,
     #[serde(default)]
     pi_auth_path: Option<PathBuf>,
+    #[serde(default)]
+    amp_settings_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -264,7 +272,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
     CapacityAccount {
         provider: if matches!(
             spec.provider.as_str(),
-            "anthropic" | "openai" | "openrouter"
+            "amp" | "anthropic" | "openai" | "openrouter"
         ) {
             spec.provider.clone()
         } else {
@@ -296,13 +304,14 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
 
 fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccount>) {
     let mut seen = HashSet::new();
+    let mut amp_configured = false;
     let mut result = Vec::new();
     let mut errors = Vec::new();
     for mut account in config.accounts.clone() {
         account.provider = account.provider.to_lowercase();
         if !matches!(
             account.provider.as_str(),
-            "anthropic" | "openai" | "openrouter"
+            "amp" | "anthropic" | "openai" | "openrouter"
         ) {
             let detail = format!("unknown provider: {}", account.provider);
             errors.push(unavailable_account(&account, detail));
@@ -322,6 +331,23 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
             );
             errors.push(unavailable_account(&account, detail));
             continue;
+        }
+        if account.provider == "amp" {
+            if account.amp_settings_path.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "ampSettingsPath cannot select an Amp identity and is not supported".into(),
+                ));
+                continue;
+            }
+            if amp_configured {
+                errors.push(unavailable_account(
+                    &account,
+                    "only one Amp account can be configured because Amp CLI exposes one authenticated identity".into(),
+                ));
+                continue;
+            }
+            amp_configured = true;
         }
         result.push(account);
     }
@@ -805,8 +831,397 @@ fn money_limit(name: &str, remaining: f64, total: Option<f64>) -> CapacityLimit 
     }
 }
 
+fn parse_amp_decimal(value: &str) -> Option<f64> {
+    let mut parts = value.split('.');
+    let integer = parts.next()?;
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || fraction
+            .is_some_and(|value| value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let groups: Vec<_> = integer.split(',').collect();
+    let valid_integer = if groups.len() == 1 {
+        !integer.is_empty() && integer.bytes().all(|c| c.is_ascii_digit())
+    } else {
+        (1..=3).contains(&groups[0].len())
+            && groups[0].bytes().all(|c| c.is_ascii_digit())
+            && groups[1..]
+                .iter()
+                .all(|group| group.len() == 3 && group.bytes().all(|c| c.is_ascii_digit()))
+    };
+    if !valid_integer {
+        return None;
+    }
+    let value: f64 = value.replace(',', "").parse().ok()?;
+    value.is_finite().then_some(value)
+}
+
+fn parse_amp_percent(value: &str) -> Option<f64> {
+    parse_amp_decimal(value).filter(|value| *value <= 100.0)
+}
+
+fn amp_money_limit(name: &str, remaining: &str, total: Option<&str>) -> Option<CapacityLimit> {
+    let total = match total {
+        Some(value) => Some(parse_amp_decimal(value)?),
+        None => None,
+    };
+    let remaining = parse_amp_decimal(remaining)?;
+    let mut limit = money_limit(name, remaining, total);
+    limit.remaining_percent = total
+        .filter(|total| *total > 0.0)
+        .map(|total| clamp_percent(remaining / total * 100.0));
+    Some(limit)
+}
+
+fn amp_metadata_line(line: &str) -> bool {
+    line.is_empty()
+        || [
+            "Signed in",
+            "Logged in as ",
+            "Account: ",
+            "Learn more:",
+            "Manage billing:",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        || line.starts_with("https://")
+        || line.starts_with("http://")
+}
+
+fn amp_signed_out_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "not signed in",
+        "not logged in",
+        "run amp login",
+        "sign in to amp",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn valid_amp_advice_suffix(suffix: &str) -> bool {
+    suffix.is_empty()
+        || ((suffix.starts_with(" (") || suffix.starts_with(" - "))
+            && (suffix.contains("https://") || suffix.contains("http://")))
+}
+
+fn valid_amp_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(char::is_control)
+}
+
+fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLimit>> {
+    let mut limits = Vec::new();
+    let mut contract_lines = 0;
+    let mut parsed_lines = 0;
+    let mut signed_out = false;
+    for line in output.lines().map(str::trim) {
+        if amp_metadata_line(line) {
+            continue;
+        }
+        if amp_signed_out_line(line) {
+            signed_out = true;
+            continue;
+        }
+        contract_lines += 1;
+        if let Some(rest) = line.strip_prefix("Amp Free: $") {
+            let Some((remaining, rest)) = rest.split_once("/$") else {
+                continue;
+            };
+            let Some((total, detail)) = rest.split_once(" remaining (replenishes +$") else {
+                continue;
+            };
+            let Some(rate) = detail.strip_suffix("/hour)") else {
+                continue;
+            };
+            let Some(mut limit) = amp_money_limit("Amp Free", remaining, Some(total)) else {
+                continue;
+            };
+            let Some(rate) = parse_amp_decimal(rate) else {
+                continue;
+            };
+            limit.detail = format!("replenishes ${rate:.2}/hour");
+            limits.push(limit);
+            parsed_lines += 1;
+            continue;
+        }
+        if let Some(percent) = line
+            .strip_prefix("Amp Free: ")
+            .and_then(|value| value.strip_suffix("% remaining today (resets daily)"))
+            .and_then(parse_amp_percent)
+        {
+            limits.push(CapacityLimit {
+                name: "Amp Free".into(),
+                kind: "quota".into(),
+                unit: "percent".into(),
+                remaining: None,
+                total: None,
+                remaining_percent: Some(percent),
+                resets_at: None,
+                status: LimitStatus::Ok,
+                detail: "resets daily".into(),
+            });
+            parsed_lines += 1;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Subscription ") {
+            let Some((plan, rest)) = rest.split_once(": ") else {
+                continue;
+            };
+            if !valid_amp_name(plan) {
+                continue;
+            }
+            let Some((other, rest)) = rest.split_once("% other usage and ") else {
+                continue;
+            };
+            let Some((orb, days)) =
+                rest.split_once("% orb usage remaining - resets upon renewal in ")
+            else {
+                continue;
+            };
+            let days = days
+                .strip_suffix(" days")
+                .or_else(|| days.strip_suffix(" day"));
+            let (Some(other), Some(orb), Some(days)) = (
+                parse_amp_percent(other),
+                parse_amp_percent(orb),
+                days.and_then(|days| {
+                    days.bytes()
+                        .all(|c| c.is_ascii_digit())
+                        .then(|| days.parse::<i64>().ok())
+                        .flatten()
+                }),
+            ) else {
+                continue;
+            };
+            let Some(reset) =
+                Duration::try_days(days).and_then(|days| now.checked_add_signed(days))
+            else {
+                continue;
+            };
+            let day_unit = if days == 1 { "day" } else { "days" };
+            for (lane, percent, detail) in [
+                (
+                    "other",
+                    other,
+                    format!("renewal reported in {days} {day_unit}"),
+                ),
+                ("orb", orb, String::new()),
+            ] {
+                limits.push(CapacityLimit {
+                    name: format!("{plan} · {lane}"),
+                    kind: "quota".into(),
+                    unit: "percent".into(),
+                    remaining: None,
+                    total: None,
+                    remaining_percent: Some(percent),
+                    resets_at: Some(reset),
+                    status: LimitStatus::Ok,
+                    detail,
+                });
+            }
+            parsed_lines += 1;
+            continue;
+        }
+        if let Some((remaining, suffix)) = line
+            .strip_prefix("Individual credits: $")
+            .and_then(|value| value.split_once(" remaining"))
+        {
+            if valid_amp_advice_suffix(suffix) {
+                if let Some(limit) = amp_money_limit("Individual credits", remaining, None) {
+                    limits.push(limit);
+                    parsed_lines += 1;
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Workspace ") {
+            let Some((name, value)) = rest.split_once(": $") else {
+                continue;
+            };
+            let Some((remaining, suffix)) = value.split_once(" remaining") else {
+                continue;
+            };
+            if valid_amp_name(name) && valid_amp_advice_suffix(suffix) {
+                if let Some(limit) = amp_money_limit(&format!("Workspace {name}"), remaining, None)
+                {
+                    limits.push(limit);
+                    parsed_lines += 1;
+                }
+            }
+        }
+    }
+    if limits.is_empty() && signed_out {
+        return Err(anyhow!("Amp CLI is signed out"));
+    }
+    if limits.is_empty() || parsed_lines != contract_lines {
+        return Err(anyhow!(
+            "Amp usage output did not match text contract v{AMP_USAGE_TEXT_VERSION}"
+        ));
+    }
+    Ok(limits)
+}
+
+#[cfg(unix)]
+fn read_pipe(
+    mut pipe: impl Read + AsRawFd + Send + 'static,
+    child_exited: Arc<AtomicBool>,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let result = loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break Ok(output),
+                Ok(read) => output.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if child_exited.load(Ordering::Acquire) {
+                        break Ok(output);
+                    }
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    Ok(receiver)
+}
+
+#[cfg(not(unix))]
+fn read_pipe(
+    mut pipe: impl Read + Send + 'static,
+    _child_exited: Arc<()>,
+) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    Ok(receiver)
+}
+
+fn command_diagnostic(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    truncate_text(&text.split_whitespace().collect::<Vec<_>>().join(" "), 300)
+}
+
+fn stop_running_command(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn command_stdout_with_timeout(
+    program: &Path,
+    args: &[String],
+    timeout: StdDuration,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start {}", program.display()))?;
+    #[cfg(unix)]
+    let child_exited = Arc::new(AtomicBool::new(false));
+    #[cfg(not(unix))]
+    let child_exited = Arc::new(());
+    let stdout = read_pipe(
+        child.stdout.take().context("capture command stdout")?,
+        Arc::clone(&child_exited),
+    )?;
+    let stderr = read_pipe(
+        child.stderr.take().context("capture command stderr")?,
+        Arc::clone(&child_exited),
+    )?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("wait for command")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            stop_running_command(&mut child);
+            #[cfg(unix)]
+            child_exited.store(true, Ordering::Release);
+            return Err(anyhow!(
+                "command timed out after {}s",
+                timeout.as_secs_f64()
+            ));
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    };
+    #[cfg(unix)]
+    child_exited.store(true, Ordering::Release);
+    let receive = |reader: &Receiver<io::Result<Vec<u8>>>| {
+        reader
+            .recv_timeout(StdDuration::from_secs(1))
+            .map_err(|_| anyhow!("command output collection timed out"))?
+            .map_err(anyhow::Error::from)
+    };
+    let stdout = receive(&stdout)?;
+    let stderr = receive(&stderr)?;
+    if !status.success() {
+        let diagnostic = command_diagnostic(&stderr);
+        return if diagnostic.is_empty() {
+            Err(anyhow!("command failed with status {status}"))
+        } else {
+            Err(anyhow!("command failed with status {status}: {diagnostic}"))
+        };
+    }
+    Ok(stdout)
+}
+
+fn collect_amp(_spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
+    let stdout =
+        command_stdout_with_timeout(Path::new("amp"), &["usage".into()], AMP_USAGE_TIMEOUT)
+            .context("run official amp usage command")?;
+    let output = String::from_utf8(stdout).context("amp usage output is not UTF-8")?;
+    parse_amp_usage_at(&output, Utc::now())
+}
+
 fn collect_limits(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     match spec.provider.as_str() {
+        "amp" => collect_amp(spec),
         "anthropic" => collect_anthropic(spec),
         "openai" => collect_openai(spec),
         "openrouter" => collect_openrouter(spec),
@@ -950,6 +1365,7 @@ fn collect_all(config: &Config, force: bool) -> Result<Vec<CapacityAccount>> {
 
 fn provider_name(provider: &str) -> &'static str {
     match provider {
+        "amp" => "AMP",
         "anthropic" => "CLAUDE",
         "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
@@ -959,6 +1375,7 @@ fn provider_name(provider: &str) -> &'static str {
 
 fn provider_color(provider: &str) -> &'static str {
     match provider {
+        "amp" => "\x1b[38;5;141m",
         "anthropic" => "\x1b[38;5;173m",
         "openai" => "\x1b[38;5;37m",
         "openrouter" => "\x1b[38;5;75m",
@@ -1061,26 +1478,8 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
         return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
-    if limit.unit == "usd" {
-        let remaining = limit.remaining.unwrap_or(0.0);
-        if compact {
-            let summary = format!("${remaining:.2}{stale}");
-            let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-            return format!("{} {summary}", pad_text(&limit.name, name_width));
-        }
-        let color = if remaining < config.critical_usd.unwrap_or(5.0) {
-            "\x1b[31m"
-        } else if remaining < config.warning_usd.unwrap_or(10.0) {
-            "\x1b[33m"
-        } else {
-            "\x1b[32m"
-        };
-        let summary = format!("${remaining:.2} remaining{stale}");
-        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
-        return format!(
-            "{} {color}${remaining:.2}\x1b[0m remaining{stale}",
-            pad_text(&limit.name, name_width)
-        );
+    if limit.unit == "usd" && limit.remaining.is_some() {
+        return render_money_limit(limit, config, compact, true, width);
     }
     let Some(percent) = limit.remaining_percent else {
         let name = truncate_text(&limit.name, width.saturating_sub(8).max(1));
@@ -1113,6 +1512,123 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         ),
         percent.round()
     )
+}
+
+fn render_money_limit(
+    limit: &CapacityLimit,
+    config: &Config,
+    compact: bool,
+    include_remaining: bool,
+    width: usize,
+) -> String {
+    let remaining = limit.remaining.unwrap_or(0.0);
+    let stale = if limit.status == LimitStatus::Stale {
+        " ~"
+    } else {
+        ""
+    };
+    let total = limit.total.map(|total| format!("/${total:.2}"));
+    let total = total.as_deref().unwrap_or_default();
+    let suffix = if include_remaining && !compact {
+        " remaining"
+    } else {
+        ""
+    };
+    let summary = format!("${remaining:.2}{total}{suffix}{stale}");
+    if UnicodeWidthStr::width(summary.as_str()) + 2 > width {
+        return truncate_text(&summary, width);
+    }
+    let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+    if compact {
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
+    }
+    let color_value = limit.remaining_percent.unwrap_or(remaining);
+    let (warning, critical) = if limit.total.is_some() {
+        (
+            config.warning_percent.unwrap_or(20.0),
+            config.critical_percent.unwrap_or(10.0),
+        )
+    } else {
+        (
+            config.warning_usd.unwrap_or(10.0),
+            config.critical_usd.unwrap_or(5.0),
+        )
+    };
+    let color = if color_value < critical {
+        "\x1b[31m"
+    } else if color_value < warning {
+        "\x1b[33m"
+    } else {
+        "\x1b[32m"
+    };
+    format!(
+        "{} {color}${remaining:.2}\x1b[0m{total}{suffix}{stale}",
+        pad_text(&limit.name, name_width)
+    )
+}
+
+fn render_amp_limits(
+    limits: &[CapacityLimit],
+    config: &Config,
+    compact: bool,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < limits.len() {
+        let limit = &limits[index];
+        let subscription = limit.name.strip_suffix(" · other").filter(|plan| {
+            limits
+                .get(index + 1)
+                .is_some_and(|next| next.name == format!("{plan} · orb"))
+        });
+        if let Some(plan) = subscription {
+            let reset = format_reset(limit.resets_at);
+            let heading = if reset.is_empty() {
+                plan.to_string()
+            } else if compact {
+                format!("{plan} · {reset}")
+            } else {
+                format!("{plan} [renewal in {reset}]")
+            };
+            lines.push(format!(
+                "  \x1b[1m{}\x1b[0m",
+                truncate_text(&heading, width.saturating_sub(2))
+            ));
+            let indent = if compact { "  " } else { "    " };
+            for (lane, name) in [(&limits[index], "Other"), (&limits[index + 1], "Orbs")] {
+                let mut lane = lane.clone();
+                lane.name = name.into();
+                lane.resets_at = None;
+                lane.detail.clear();
+                lines.push(format!(
+                    "{indent}{}",
+                    render_limit(&lane, config, compact, width.saturating_sub(indent.len()))
+                ));
+            }
+            index += 2;
+            continue;
+        }
+
+        let mut rendered = limit.clone();
+        if rendered.name == "Individual credits" {
+            rendered.name = "Available Credits".into();
+        }
+        let rendered_line = if rendered.name == "Available Credits" {
+            render_money_limit(&rendered, config, compact, false, width.saturating_sub(2))
+        } else {
+            render_limit(&rendered, config, compact, width.saturating_sub(2))
+        };
+        lines.push(format!("  {rendered_line}"));
+        if !compact && !rendered.detail.is_empty() {
+            lines.push(format!(
+                "  \x1b[2m{}\x1b[0m",
+                truncate_text(&rendered.detail, width.saturating_sub(2))
+            ));
+        }
+        index += 1;
+    }
+    lines
 }
 
 fn herdr_panes() -> Vec<Pane> {
@@ -1281,7 +1797,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
         },
         String::new(),
     ];
-    for provider in ["invalid", "anthropic", "openai", "openrouter"] {
+    for provider in ["invalid", "amp", "anthropic", "openai", "openrouter"] {
         let group: Vec<_> = accounts
             .iter()
             .filter(|account| account.provider == provider)
@@ -1313,16 +1829,20 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
             ));
-            for limit in &account.limits {
-                lines.push(format!(
-                    "  {}",
-                    render_limit(limit, config, compact, width.saturating_sub(2))
-                ));
-                if !compact && !limit.detail.is_empty() {
+            if account.provider == "amp" {
+                lines.extend(render_amp_limits(&account.limits, config, compact, width));
+            } else {
+                for limit in &account.limits {
                     lines.push(format!(
-                        "  \x1b[2m{}\x1b[0m",
-                        truncate_text(&limit.detail, width.saturating_sub(2))
+                        "  {}",
+                        render_limit(limit, config, compact, width.saturating_sub(2))
                     ));
+                    if !compact && !limit.detail.is_empty() {
+                        lines.push(format!(
+                            "  \x1b[2m{}\x1b[0m",
+                            truncate_text(&limit.detail, width.saturating_sub(2))
+                        ));
+                    }
                 }
             }
             if !compact && !account.error.is_empty() {
@@ -1348,21 +1868,31 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
 }
 
 fn terminal_width() -> usize {
-    if let Ok(tty) = fs::File::open("/dev/tty") {
-        if let Ok(output) = Command::new("stty")
-            .arg("size")
-            .stdin(Stdio::from(tty))
-            .output()
-        {
-            if output.status.success() {
-                if let Some(width) = String::from_utf8_lossy(&output.stdout)
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|width| *width > 0)
-                {
-                    return width;
-                }
+    if let Some(width) = env::var("MODEL_CAPACITY_WIDTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|width: &usize| *width > 0)
+    {
+        return width;
+    }
+    #[cfg(unix)]
+    {
+        let width = |fd| {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0)
+                .then(|| usize::from(size.ws_col))
+        };
+        if let Some(width) = width(io::stdout().as_raw_fd()) {
+            return width;
+        }
+        if let Ok(tty) = fs::File::open("/dev/tty") {
+            if let Some(width) = width(tty.as_raw_fd()) {
+                return width;
             }
         }
     }
@@ -1465,6 +1995,215 @@ mod tests {
     }
 
     #[test]
+    fn parses_amp_free_dollar_contract() {
+        let limits = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/free_dollars.txt"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].name, "Amp Free");
+        assert_eq!(limits[0].remaining, Some(4.71));
+        assert_eq!(limits[0].total, Some(10.0));
+        assert!(limits[0]
+            .remaining_percent
+            .is_some_and(|percent| (percent - 47.1).abs() < 0.001));
+        assert_eq!(limits[0].detail, "replenishes $0.42/hour");
+    }
+
+    #[test]
+    fn parses_amp_free_daily_contract_without_inventing_reset_time() {
+        let limits = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/free_daily.txt"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(limits[0].remaining_percent, Some(61.0));
+        assert_eq!(limits[0].resets_at, None);
+        assert_eq!(limits[0].detail, "resets daily");
+    }
+
+    #[test]
+    fn parses_amp_subscription_lanes_and_approximate_renewal() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let limits =
+            parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
+                .unwrap();
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| (limit.name.as_str(), limit.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Megawatt · other", Some(97.0)),
+                ("Megawatt · orb", Some(100.0))
+            ]
+        );
+        assert!(limits
+            .iter()
+            .all(|limit| limit.resets_at == Some(now + Duration::days(29))));
+        assert_eq!(
+            limits
+                .iter()
+                .filter(|limit| limit.detail == "renewal reported in 29 days")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parses_singular_amp_subscription_renewal_day() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let limits = parse_amp_usage_at(
+            "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 1 day",
+            now,
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 2);
+        assert!(limits
+            .iter()
+            .all(|limit| limit.resets_at == Some(now + Duration::days(1))));
+        assert_eq!(limits[0].detail, "renewal reported in 1 day");
+    }
+
+    #[test]
+    fn parses_amp_individual_and_multiple_workspace_balances() {
+        let credits = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/credits.txt"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(credits[0].remaining, Some(25.64));
+
+        let workspaces = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/workspaces.txt"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].name, "Workspace Example One");
+        assert_eq!(workspaces[0].remaining, Some(1234.56));
+        assert_eq!(workspaces[1].remaining, Some(78.90));
+    }
+
+    #[test]
+    fn parses_combined_amp_contract_and_ignores_identity_and_advice() {
+        let limits = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/combined.txt"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 5);
+        assert!(limits.iter().all(|limit| !limit.name.contains('@')));
+    }
+
+    #[test]
+    fn rejects_amp_signed_out_and_parse_drift_instead_of_returning_zero() {
+        for output in [
+            "You are not signed in. Run amp login.",
+            "Amp Free now has plenty remaining",
+            "Individual credits: $5.00 remaining\nWorkspace changed format",
+            "Amp Free: $4.71/$oops remaining (replenishes +$0.42/hour)",
+            "Amp Free: -1% remaining today (resets daily)",
+            "Amp Free: 101% remaining today (resets daily)",
+            "Individual credits: $NaN remaining",
+            "Individual credits: $5.00 remaining unexpected text",
+            "Individual credits: $5.00 remaining\nTeam Demo: $50.00 remaining",
+            "Workspace Demo\u{1b}[2J: $5.00 remaining",
+            "Subscription Demo\u{7}: 97% other usage and 100% orb usage remaining - resets upon renewal in 29 days",
+            "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 999999999999999999 days",
+        ] {
+            assert!(parse_amp_usage_at(output, Utc::now()).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_in_amp_usage_can_include_login_advice() {
+        let limits = parse_amp_usage_at(
+            "Individual credits: $25.64 remaining\nRun amp login to switch accounts",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].remaining, Some(25.64));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amp_process_contract_sets_no_color_and_null_stdin() {
+        let output = command_stdout_with_timeout(
+            Path::new("sh"),
+            &[
+                "-c".into(),
+                "test \"$NO_COLOR\" = 1 && ! read value && printf ok".into(),
+            ],
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn amp_process_contract_surfaces_missing_failure_and_timeout() {
+        assert!(command_stdout_with_timeout(
+            Path::new("definitely-not-a-real-amp-command"),
+            &[],
+            StdDuration::from_secs(1)
+        )
+        .is_err());
+        assert!(command_stdout_with_timeout(
+            Path::new("sh"),
+            &["-c".into(), "exit 7".into()],
+            StdDuration::from_secs(1)
+        )
+        .is_err());
+        let started = Instant::now();
+        assert!(command_stdout_with_timeout(
+            Path::new("sh"),
+            &["-c".into(), "sleep 2 & wait".into()],
+            StdDuration::from_millis(30)
+        )
+        .is_err());
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_command_does_not_wait_for_descendant_pipe_holders() {
+        let started = Instant::now();
+        let output = command_stdout_with_timeout(
+            Path::new("sh"),
+            &["-c".into(), "sleep 2 & printf ok".into()],
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output, b"ok");
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_failure_includes_sanitized_stderr() {
+        let error = command_stdout_with_timeout(
+            Path::new("sh"),
+            &[
+                "-c".into(),
+                "printf 'not signed in; run amp login\\n' >&2; exit 1".into(),
+            ],
+            StdDuration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not signed in; run amp login"));
+        assert!(!error.contains('\n'));
+    }
+
+    #[test]
     fn config_mistakes_become_unavailable_accounts() {
         let config: Config = serde_json::from_value(json!({
             "accounts": [
@@ -1484,6 +2223,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_amp_account_configuration() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [
+                {"provider": "amp", "accountId": "default", "label": "AMP"},
+                {"provider": "amp", "accountId": "work", "label": "Work AMP"},
+                {
+                    "provider": "amp",
+                    "accountId": "settings",
+                    "label": "Settings AMP",
+                    "ampSettingsPath": "/tmp/amp-settings.json"
+                }
+            ]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|account| account
+            .error
+            .contains("only one Amp account can be configured")));
+        assert!(errors
+            .iter()
+            .any(|account| account.error.contains("ampSettingsPath")));
+    }
+
+    #[test]
     fn renders_multiple_accounts_as_separate_capacity_lines() {
         let accounts = vec![
             test_account("personal", "Personal", 28.0),
@@ -1499,6 +2264,158 @@ mod tests {
         let accounts = vec![test_account("personal", "個人 subscription", 28.0)];
         let output = render(&Config::default(), &accounts, false, 4);
         assert!(output.lines().all(|line| UnicodeWidthStr::width(line) <= 4));
+    }
+
+    #[test]
+    fn renders_amp_cards_in_narrow_and_wide_layouts() {
+        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut limits =
+            parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
+                .unwrap();
+        limits.push(money_limit("Individual credits", 25.64, None));
+        let account = CapacityAccount {
+            provider: "amp".into(),
+            account_id: "billing".into(),
+            label: "AMP billing".into(),
+            auth_type: "cli".into(),
+            limits,
+            fetched_at: Utc::now(),
+            error: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        for width in [30, 80] {
+            let output = strip_ansi(&render(
+                &Config::default(),
+                std::slice::from_ref(&account),
+                false,
+                width,
+            ));
+            assert!(output.contains("AMP"));
+            assert!(output.contains("AMP billing"));
+            assert!(output.contains("$25.64"));
+            assert!(output.contains("Other"));
+            assert!(output.contains("Orbs"));
+        }
+        let output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            false,
+            80,
+        ));
+        assert!(output.contains("Megawatt [renewal in "));
+        assert!(output.contains("Other"));
+        assert!(output.contains("Orbs"));
+        assert!(output.contains("Available Credits"));
+        assert!(!output.contains("Individual credits"));
+        assert!(!output.contains("renewal reported"));
+        assert!(!output.contains("$25.64 remaining"));
+        assert_eq!(output.matches("renewal in").count(), 1);
+
+        let mut narrow_account = account.clone();
+        let narrow_reset = Utc::now() + Duration::days(29);
+        narrow_account.limits[0].resets_at = Some(narrow_reset);
+        narrow_account.limits[1].resets_at = Some(narrow_reset);
+        let narrow_output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&narrow_account),
+            false,
+            24,
+        ));
+        assert!(narrow_output.contains("Megawatt · "));
+
+        let warning_output = render(
+            &Config {
+                critical_usd: Some(30.0),
+                ..Config::default()
+            },
+            std::slice::from_ref(&account),
+            false,
+            80,
+        );
+        assert!(warning_output.contains("\x1b[31m$25.64\x1b[0m"));
+
+        let mut expired = account.clone();
+        expired.limits[0].resets_at = Some(Utc::now() - Duration::days(1));
+        expired.limits[1].resets_at = expired.limits[0].resets_at;
+        let expired_output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&expired),
+            false,
+            80,
+        ));
+        assert!(!expired_output.contains("renewal in"));
+        assert!(!expired_output.contains("renewal reported"));
+    }
+
+    #[test]
+    fn compact_money_keeps_its_name_and_amp_free_shows_its_cap() {
+        let credits = money_limit("API credits", 1234.56, None);
+        let compact = render_money_limit(&credits, &Config::default(), true, true, 18);
+        assert!(compact.contains("API"));
+        assert!(!compact.contains("remaining"));
+
+        let amp_free = amp_money_limit("Amp Free", "4.71", Some("10")).unwrap();
+        let wide = render_money_limit(&amp_free, &Config::default(), false, true, 80);
+        assert!(strip_ansi(&wide).contains("$4.71/$10.00 remaining"));
+        assert!(wide.contains("\x1b[32m$4.71\x1b[0m"));
+    }
+
+    #[test]
+    fn stale_unknown_money_is_not_rendered_as_zero() {
+        let limit = CapacityLimit {
+            name: "key limit".into(),
+            kind: "credits".into(),
+            unit: "usd".into(),
+            remaining: None,
+            total: None,
+            remaining_percent: None,
+            resets_at: None,
+            status: LimitStatus::Stale,
+            detail: "this key has no spending limit".into(),
+        };
+        let output = render_limit(&limit, &Config::default(), false, 60);
+        assert!(output.contains("unknown"));
+        assert!(!output.contains("$0.00"));
+    }
+
+    #[test]
+    fn long_ascii_and_cjk_amp_names_stay_within_the_pane() {
+        let account = CapacityAccount {
+            provider: "amp".into(),
+            account_id: "billing".into(),
+            label: "Very long Amp billing account label".into(),
+            auth_type: "cli".into(),
+            limits: vec![
+                money_limit("Workspace A very long workspace capacity name", 24.0, None),
+                CapacityLimit {
+                    name: "非常に長いワークスペース名 · orb".into(),
+                    kind: "quota".into(),
+                    unit: "percent".into(),
+                    remaining: None,
+                    total: None,
+                    remaining_percent: Some(94.0),
+                    resets_at: None,
+                    status: LimitStatus::Ok,
+                    detail: String::new(),
+                },
+            ],
+            fetched_at: Utc::now(),
+            error: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        for width in [20, 30, 36, 80] {
+            let output = render(
+                &Config::default(),
+                std::slice::from_ref(&account),
+                false,
+                width,
+            );
+            assert!(output
+                .lines()
+                .all(|line| UnicodeWidthStr::width(strip_ansi(line).as_str()) <= width));
+        }
     }
 
     #[test]
@@ -1540,9 +2457,13 @@ mod tests {
                 false,
                 width,
             );
-            assert!(output
-                .lines()
-                .all(|line| UnicodeWidthStr::width(strip_ansi(line).as_str()) <= width));
+            for line in output.lines() {
+                let line = strip_ansi(line);
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= width,
+                    "line exceeds width {width}: {line:?}"
+                );
+            }
         }
     }
 
@@ -1661,6 +2582,7 @@ mod tests {
             token_env: None,
             management_key_env: None,
             pi_auth_path: None,
+            amp_settings_path: None,
         }
     }
 

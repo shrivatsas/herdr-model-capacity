@@ -45,10 +45,12 @@ flowchart TD
     E -->|anthropic| F["Claude Code OAuth credential<br/>or macOS Keychain secretRef<br/>→ api.anthropic.com/api/oauth/usage"]
     E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
     E -->|openrouter| H["openrouter.ai<br/>/api/v1/key or /api/v1/credits<br/>key named by env var"]
+    E -->|amp| I["<b>amp usage</b><br/>single CLI identity<br/>version-1 text parser"]
 
     F --> J
     G --> J
-    H --> J["<b>normalize</b> → CapacityLimit<br/>quota percent · USD balance<br/>reset time · status"]
+    H --> J
+    I --> J["<b>normalize</b> → CapacityLimit<br/>quota percent · USD balance<br/>reset time · status"]
 
     J --> K["<b>render</b><br/>group by provider<br/>truncate to pane width"]
     K --> A
@@ -81,7 +83,7 @@ sequenceDiagram
             Note over P,C: reuse cached card, no network or CLI call
         else expired, fingerprint changed, or forced by [r]
             P->>X: collect(spec)
-            X->>S: OAuth usage · rateLimits · credits
+            X->>S: OAuth usage · rateLimits · amp usage · credits
             alt success
                 S-->>X: provider payload
                 X-->>P: normalized limits
@@ -99,9 +101,9 @@ sequenceDiagram
 ```
 
 The `collectorFingerprint` covers every input that changes what a collector
-reads — config dir, `CODEX_HOME`, env-var names, Keychain reference — so editing
-the registry invalidates that account's cache instead of showing a value
-collected from a different source.
+reads — config dir, `CODEX_HOME`, env-var names, Keychain reference, settings
+path — so editing the registry invalidates that account's cache instead of
+showing a value collected from a different source.
 
 ## Install and open
 
@@ -207,6 +209,13 @@ used to help author it, but never defines dashboard accounts.
       "authType": "api",
       "source": "openrouter",
       "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY"
+    },
+    {
+      "provider": "amp",
+      "accountId": "amp-billing",
+      "label": "Amp billing",
+      "authType": "cli",
+      "source": "amp-cli"
     }
   ]
 }
@@ -234,7 +243,8 @@ bindings:
 ```
 
 Bindings never create or rename billing accounts. Dynamic Amp routing is not
-guessed.
+guessed. An Amp billing account (`"provider": "amp"`) is independent of an
+optional Amp agent binding; configuring one does not create the other.
 
 ## Provider collection and limitations
 
@@ -274,11 +284,35 @@ An inference key uses the documented `/api/v1/key` endpoint. A management key
 uses `/api/v1/credits` for account-wide balance. Secrets are named by environment
 variable and are not stored in plugin config or state.
 
+### Amp
+
+An Amp account runs the official authenticated `amp usage` command. Amp CLI
+owns login and credential storage; the plugin does not read Amp token files or
+call Amp's internal billing API. The command runs non-interactively with null
+stdin, color disabled, and a 10-second overall timeout.
+
+The parser supports the current version-1 text forms for Amp Free dollar or
+daily-percent capacity, separate subscription “other” and “orb” lanes,
+individual credits, and multiple workspace balances. Dollar balances render as
+dollars. A subscription renewal timestamp is only approximated when the CLI
+reports a number of days; “resets daily” is retained as detail without inventing
+an exact timestamp. Identity lines and trailing CLI advice are ignored, and the
+registry's `accountId` and `label` remain authoritative.
+
+Amp CLI currently exposes one authenticated identity to `amp usage`, so only one
+Amp billing account may be configured. A missing CLI, signed-out identity,
+timeout, command error, or unrecognized capacity text makes a never-fetched card
+unavailable and retains a previous successful value as stale—never as zero.
+Because `amp usage` is a human-readable, versioned text contract, a future CLI
+wording change may require a parser update.
+
 ## Security model
 
 - The registry stores labels, home/config paths, environment-variable names,
   and Keychain service/account references—never OAuth or setup-token values.
 - Codex app-server is the sole owner of Codex auth and refresh.
+- Amp CLI is the sole owner of Amp authentication; Amp credentials and raw
+  identity output are not stored.
 - Provider responses cached under the plugin state directory contain normalized
   limits and errors, not credentials.
 - Diagnostics do not include secret values.
@@ -301,6 +335,19 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 bash -n bin/*.sh
 ```
+
+For a manual smoke test with one explicit account card for every provider and
+agent bindings hidden, run:
+
+```bash
+bash bin/manual-test.sh
+```
+
+Use `--probe` for normalized JSON or `--herdr` to back up the current plugin
+registry, install the four-provider test registry, and link this checkout. The
+script includes each account home under `~/.claude-accounts` and
+`~/.codex-accounts`; `~/.claude` and `~/.codex` are used only when their account
+directories are absent.
 
 The original implementation brief and research notes are in [SPEC.md](SPEC.md).
 

@@ -1478,7 +1478,7 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
         let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
         return format!("{} {summary}", pad_text(&limit.name, name_width));
     }
-    if limit.unit == "usd" {
+    if limit.unit == "usd" && limit.remaining.is_some() {
         return render_money_limit(limit, config, compact, true, width);
     }
     let Some(percent) = limit.remaining_percent else {
@@ -1583,18 +1583,18 @@ fn render_amp_limits(
                 .is_some_and(|next| next.name == format!("{plan} · orb"))
         });
         if let Some(plan) = subscription {
-            if !compact {
-                let reset = format_reset(limit.resets_at);
-                let renewal = if reset.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [renewal in {reset}]")
-                };
-                lines.push(format!(
-                    "  \x1b[1m{}\x1b[0m",
-                    truncate_text(&format!("{plan}{renewal}"), width.saturating_sub(2))
-                ));
-            }
+            let reset = format_reset(limit.resets_at);
+            let heading = if reset.is_empty() {
+                plan.to_string()
+            } else if compact {
+                format!("{plan} · {reset}")
+            } else {
+                format!("{plan} [renewal in {reset}]")
+            };
+            lines.push(format!(
+                "  \x1b[1m{}\x1b[0m",
+                truncate_text(&heading, width.saturating_sub(2))
+            ));
             let indent = if compact { "  " } else { "    " };
             for (lane, name) in [(&limits[index], "Other"), (&limits[index + 1], "Orbs")] {
                 let mut lane = lane.clone();
@@ -2312,6 +2312,19 @@ mod tests {
         assert!(!output.contains("renewal reported"));
         assert!(!output.contains("$25.64 remaining"));
         assert_eq!(output.matches("renewal in").count(), 1);
+
+        let mut narrow_account = account.clone();
+        let narrow_reset = Utc::now() + Duration::days(29);
+        narrow_account.limits[0].resets_at = Some(narrow_reset);
+        narrow_account.limits[1].resets_at = Some(narrow_reset);
+        let narrow_output = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&narrow_account),
+            false,
+            24,
+        ));
+        assert!(narrow_output.contains("Megawatt · "));
+
         let warning_output = render(
             &Config {
                 critical_usd: Some(30.0),
@@ -2347,6 +2360,24 @@ mod tests {
         let wide = render_money_limit(&amp_free, &Config::default(), false, true, 80);
         assert!(strip_ansi(&wide).contains("$4.71/$10.00 remaining"));
         assert!(wide.contains("\x1b[32m$4.71\x1b[0m"));
+    }
+
+    #[test]
+    fn stale_unknown_money_is_not_rendered_as_zero() {
+        let limit = CapacityLimit {
+            name: "key limit".into(),
+            kind: "credits".into(),
+            unit: "usd".into(),
+            remaining: None,
+            total: None,
+            remaining_percent: None,
+            resets_at: None,
+            status: LimitStatus::Stale,
+            detail: "this key has no spending limit".into(),
+        };
+        let output = render_limit(&limit, &Config::default(), false, 60);
+        assert!(output.contains("unknown"));
+        assert!(!output.contains("$0.00"));
     }
 
     #[test]

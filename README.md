@@ -62,8 +62,9 @@ service/account *references* only.
 
 ## Refresh flow
 
-Each account is collected independently, and a failure degrades that one card
-rather than the pane.
+Each account is collected independently (up to four refreshes at once), and a
+failure degrades that one card rather than the pane. Completed results are
+reassembled in configured order before rendering.
 
 ```mermaid
 sequenceDiagram
@@ -75,7 +76,7 @@ sequenceDiagram
 
     P->>P: load model-capacity.json,<br/>validate + de-duplicate accounts
 
-    loop each configured account
+    loop up to four concurrent workers claim configured accounts
         P->>C: read cache keyed by sha256 of provider + accountId
         C-->>P: cached card + collector fingerprint
 

@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::AtomicUsize;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
@@ -25,6 +26,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_REFRESH_SECONDS: i64 = 180;
+// Keep cold-cache refreshes responsive without letting configured accounts create an
+// unbounded number of HTTP clients or collector subprocesses at once.
+const MAX_CONCURRENT_COLLECTORS: usize = 4;
 const AMP_USAGE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const AMP_USAGE_TEXT_VERSION: u8 = 1;
 
@@ -1593,17 +1597,63 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
     }
 }
 
+fn collect_with_bounded_parallelism<T, R>(
+    items: &[T],
+    maximum_workers: usize,
+    collect: impl Fn(&T) -> R + Send + Sync,
+) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let workers = maximum_workers.max(1).min(items.len());
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let next = &next;
+            let collect = &collect;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index >= items.len() {
+                    break;
+                }
+                // The receiver is drained below before the scoped workers are joined, so
+                // a slow account cannot prevent a completed account from being recorded.
+                sender
+                    .send((index, collect(&items[index])))
+                    .expect("collection receiver remains available");
+            });
+        }
+        drop(sender);
+
+        let mut results = (0..items.len()).map(|_| None).collect::<Vec<Option<R>>>();
+        for (index, result) in receiver {
+            results[index] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("every collection worker returns one result"))
+            .collect()
+    })
+}
+
 fn collect_all(config: &Config, force: bool) -> Result<Vec<CapacityAccount>> {
     let refresh = config
         .refresh_seconds
         .unwrap_or(DEFAULT_REFRESH_SECONDS)
         .max(60);
     let (specs, mut accounts) = configured_accounts(config);
-    accounts.extend(
-        specs
-            .iter()
-            .map(|spec| collect_account(spec, refresh, force)),
-    );
+    accounts.extend(collect_with_bounded_parallelism(
+        &specs,
+        MAX_CONCURRENT_COLLECTORS,
+        |spec| collect_account(spec, refresh, force),
+    ));
     Ok(accounts)
 }
 
@@ -2502,6 +2552,44 @@ mod tests {
         assert!(errors
             .iter()
             .all(|account| account.limits[0].status == LimitStatus::Unavailable));
+    }
+
+    #[test]
+    fn bounded_collection_runs_mixed_collectors_concurrently_and_keeps_input_order() {
+        let tasks = [
+            ("slow-first", 120_u64, true),
+            ("fast", 20, true),
+            ("failed", 30, false),
+            ("slow-last", 120, true),
+            ("fast-last", 20, true),
+        ];
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let results = collect_with_bounded_parallelism(&tasks, 2, {
+            let active = Arc::clone(&active);
+            let maximum_active = Arc::clone(&maximum_active);
+            move |(name, delay_ms, succeeds)| {
+                let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                maximum_active.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                thread::sleep(StdDuration::from_millis(*delay_ms));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                succeeds.then_some(*name).ok_or(*name)
+            }
+        });
+
+        assert!(started.elapsed() < StdDuration::from_millis(230));
+        assert_eq!(maximum_active.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            results,
+            vec![
+                Ok("slow-first"),
+                Ok("fast"),
+                Err("failed"),
+                Ok("slow-last"),
+                Ok("fast-last"),
+            ]
+        );
     }
 
     #[test]

@@ -108,8 +108,9 @@ showing a value collected from a different source.
 
 ## Install and open
 
-Requires Herdr 0.8.0 or newer, Rust/Cargo to build, and Python 3 for pane
-toggling:
+Requires Herdr 0.8.0 or newer, Rust/Cargo to build, Python 3 for pane
+toggling, and a native SHA-256 utility: `sha256sum` on Linux or `shasum` on
+macOS.
 
 ```bash
 herdr plugin install shrivatsas/herdr-model-capacity

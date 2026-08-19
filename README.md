@@ -44,7 +44,7 @@ flowchart TD
     D --> E{"per account:<br/><b>provider</b>"}
     E -->|anthropic| F["Claude Code OAuth credential<br/>or macOS Keychain secretRef<br/>→ api.anthropic.com/api/oauth/usage"]
     E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
-    E -->|openrouter| H["openrouter.ai<br/>/api/v1/key or /api/v1/credits<br/>key named by env var"]
+    E -->|openrouter| H["openrouter.ai<br/>/api/v1/key + optional /api/v1/credits<br/>environment or macOS Keychain"]
     E -->|amp| I["<b>amp usage</b><br/>single CLI identity<br/>version-1 text parser"]
 
     F --> J
@@ -208,7 +208,11 @@ used to help author it, but never defines dashboard accounts.
       "label": "Personal OpenRouter",
       "authType": "api",
       "source": "openrouter",
-      "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY"
+      "managementSecretRef": {
+        "kind": "macos-keychain",
+        "service": "herdr-model-capacity-openrouter",
+        "account": "management"
+      }
     },
     {
       "provider": "amp",
@@ -280,9 +284,63 @@ values. Ordinary Anthropic API keys do not expose a credit-balance endpoint.
 
 ### OpenRouter
 
-An inference key uses the documented `/api/v1/key` endpoint. A management key
-uses `/api/v1/credits` for account-wide balance. Secrets are named by environment
-variable and are not stored in plugin config or state.
+Create an ordinary inference key on OpenRouter's [API Keys
+page](https://openrouter.ai/settings/keys), or create a management key on its
+[Management API Keys page](https://openrouter.ai/settings/management-keys).
+These credentials report different capacity:
+
+- `tokenEnv` or `tokenSecretRef` uses `/api/v1/key` and reports that individual
+  key's **spending limit** and reset policy. This is not the account's purchased
+  credit balance. A key without a limit is shown as valid and unlimited at key
+  scope, rather than as an authentication failure.
+- `managementKeyEnv` or `managementSecretRef` uses `/api/v1/key` to verify the
+  credential type and safe masked label, then `/api/v1/credits` to report
+  **account-wide OpenRouter credits**.
+
+The configured account label is the card heading; OpenRouter's safe masked
+`data.label` appears beneath it as a secondary key ID, so multiple keys remain
+distinguishable. The full credential is never shown or cached. A credential
+whose actual type does not match its configured field is rejected with a
+configuration error.
+
+On macOS, store a management key in Keychain without putting it in Herdr's
+launch environment. This command prompts for the key securely (`-w` must remain
+the final option):
+
+```bash
+security add-generic-password -U \
+  -s herdr-model-capacity-openrouter \
+  -a management \
+  -w
+```
+
+Then configure the `managementSecretRef` shown in the registry example above.
+For an ordinary key, use a distinct account selector such as `ordinary` and the
+field `tokenSecretRef`.
+
+Environment variables remain available for automation:
+
+```json
+{
+  "tokenEnv": "OPENROUTER_API_KEY"
+}
+```
+
+or, for account-wide credits:
+
+```json
+{
+  "managementKeyEnv": "OPENROUTER_MANAGEMENT_KEY"
+}
+```
+
+Configure exactly one of `tokenEnv`, `managementKeyEnv`, `tokenSecretRef`, or
+`managementSecretRef`; combining an environment-variable field with a secret
+reference is an error. With one explicit field, that source is authoritative
+and ambient variables are ignored. With none, collection falls back first to
+`OPENROUTER_API_KEY`, then to the OpenRouter API key in a configured
+`piAuthPath`. Secret-reference selectors are included in cache fingerprints,
+but resolved keys are not.
 
 ### Amp
 
@@ -314,7 +372,7 @@ wording change may require a parser update.
 - Amp CLI is the sole owner of Amp authentication; Amp credentials and raw
   identity output are not stored.
 - Provider responses cached under the plugin state directory contain normalized
-  limits and errors, not credentials.
+  limits, safe masked OpenRouter key labels, and errors—not credentials.
 - Diagnostics do not include secret values.
 
 ## Development

@@ -63,6 +63,10 @@ struct CapacityAccount {
     account_id: String,
     label: String,
     auth_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    credential_label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    capacity_scope: String,
     limits: Vec<CapacityLimit>,
     fetched_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -94,6 +98,10 @@ struct AccountSpec {
     #[serde(default)]
     management_key_env: Option<String>,
     #[serde(default)]
+    token_secret_ref: Option<SecretRef>,
+    #[serde(default)]
+    management_secret_ref: Option<SecretRef>,
+    #[serde(default)]
     pi_auth_path: Option<PathBuf>,
     #[serde(default)]
     amp_settings_path: Option<PathBuf>,
@@ -105,6 +113,23 @@ struct SecretRef {
     kind: String,
     service: String,
     account: String,
+}
+
+#[derive(Debug)]
+struct CollectedCapacity {
+    limits: Vec<CapacityLimit>,
+    credential_label: String,
+    capacity_scope: String,
+}
+
+impl CollectedCapacity {
+    fn limits(limits: Vec<CapacityLimit>) -> Self {
+        Self {
+            limits,
+            credential_label: String::new(),
+            capacity_scope: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -268,6 +293,50 @@ fn keychain_item_exists(reference: &SecretRef) -> Result<()> {
     Ok(())
 }
 
+fn resolve_secret_ref(reference: &SecretRef) -> Result<String> {
+    resolve_secret_ref_with(reference, cfg!(target_os = "macos"), |reference| {
+        let output = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                &reference.service,
+                "-a",
+                &reference.account,
+                "-w",
+            ])
+            .output()
+            .context("read macOS Keychain secret")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "no macOS Keychain item for the configured service and account"
+            ));
+        }
+        String::from_utf8(output.stdout).context("macOS Keychain secret is not UTF-8")
+    })
+}
+
+fn resolve_secret_ref_with(
+    reference: &SecretRef,
+    is_macos: bool,
+    lookup: impl FnOnce(&SecretRef) -> Result<String>,
+) -> Result<String> {
+    if reference.kind != "macos-keychain" {
+        return Err(anyhow!(
+            "unsupported secret reference kind: {}",
+            reference.kind
+        ));
+    }
+    if !is_macos {
+        return Err(anyhow!("macOS Keychain secret references require macOS"));
+    }
+    let secret = lookup(reference)?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(anyhow!("configured macOS Keychain item is empty"));
+    }
+    Ok(secret.into())
+}
+
 fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
     CapacityAccount {
         provider: if matches!(
@@ -285,6 +354,8 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
             spec.label.clone()
         },
         auth_type: spec.auth_type.clone(),
+        credential_label: String::new(),
+        capacity_scope: String::new(),
         limits: vec![CapacityLimit {
             name: "capacity".into(),
             kind: "quota".into(),
@@ -349,6 +420,31 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
             }
             amp_configured = true;
         }
+        if account.provider == "openrouter" {
+            if account.secret_ref.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "secretRef is not valid for OpenRouter; use tokenSecretRef or managementSecretRef".into(),
+                ));
+                continue;
+            }
+            let configured_sources = [
+                account.token_env.is_some(),
+                account.management_key_env.is_some(),
+                account.token_secret_ref.is_some(),
+                account.management_secret_ref.is_some(),
+            ]
+            .into_iter()
+            .filter(|configured| *configured)
+            .count();
+            if configured_sources > 1 {
+                errors.push(unavailable_account(
+                    &account,
+                    "configure exactly one OpenRouter environment-variable or secret-reference credential source".into(),
+                ));
+                continue;
+            }
+        }
         result.push(account);
     }
     (result, errors)
@@ -367,7 +463,8 @@ fn client() -> Result<&'static Client> {
     Ok(CLIENT.get().expect("HTTP client was initialized"))
 }
 
-fn get_json(url: &str, mut headers: HeaderMap) -> Result<Value> {
+fn get_json(url: &str, headers: HeaderMap) -> Result<Value> {
+    let mut headers = headers;
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(
         USER_AGENT,
@@ -748,73 +845,214 @@ fn collect_openai(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     Ok(windows)
 }
 
-fn openrouter_token(spec: &AccountSpec) -> Option<String> {
-    let env_name = spec
-        .management_key_env
-        .as_ref()
-        .or(spec.token_env.as_ref())
-        .map(String::as_str)
-        .unwrap_or("OPENROUTER_API_KEY");
-    if let Ok(token) = env::var(env_name) {
-        if !token.trim().is_empty() {
-            return Some(token.trim().into());
-        }
-    }
-    let path = spec.pi_auth_path.as_ref()?;
-    let auth = read_json(path)?;
-    let entry = auth.get("openrouter")?;
-    (entry.get("type").and_then(Value::as_str) == Some("api_key"))
-        .then(|| entry.get("key").and_then(Value::as_str).map(str::to_owned))
-        .flatten()
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OpenRouterScope {
+    Key,
+    Management,
 }
 
-fn collect_openrouter(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
-    let token = openrouter_token(spec)
-        .ok_or_else(|| anyhow!("OpenRouter key environment variable is not set"))?;
+fn openrouter_credential(spec: &AccountSpec) -> Result<(OpenRouterScope, String)> {
+    openrouter_credential_with(spec, |name| env::var(name).ok(), resolve_secret_ref)
+}
+
+fn openrouter_credential_with(
+    spec: &AccountSpec,
+    env_value: impl Fn(&str) -> Option<String>,
+    secret_value: impl Fn(&SecretRef) -> Result<String>,
+) -> Result<(OpenRouterScope, String)> {
+    if spec.secret_ref.is_some() {
+        return Err(anyhow!(
+            "secretRef is not valid for OpenRouter; use tokenSecretRef or managementSecretRef"
+        ));
+    }
+    let configured_sources = [
+        spec.token_env.is_some(),
+        spec.management_key_env.is_some(),
+        spec.token_secret_ref.is_some(),
+        spec.management_secret_ref.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if configured_sources > 1 {
+        return Err(anyhow!(
+            "configure exactly one OpenRouter environment-variable or secret-reference credential source"
+        ));
+    }
+    let from_env = |name: &str, scope| {
+        env_value(name)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (scope, value.trim().into()))
+            .ok_or_else(|| anyhow!("configured OpenRouter environment variable {name} is not set"))
+    };
+    if let Some(name) = &spec.token_env {
+        return from_env(name, OpenRouterScope::Key);
+    }
+    if let Some(name) = &spec.management_key_env {
+        return from_env(name, OpenRouterScope::Management);
+    }
+    if let Some(reference) = &spec.token_secret_ref {
+        return Ok((OpenRouterScope::Key, secret_value(reference)?));
+    }
+    if let Some(reference) = &spec.management_secret_ref {
+        return Ok((OpenRouterScope::Management, secret_value(reference)?));
+    }
+    if let Some(token) = env_value("OPENROUTER_API_KEY").filter(|value| !value.trim().is_empty()) {
+        return Ok((OpenRouterScope::Key, token.trim().into()));
+    }
+    if let Some(path) = &spec.pi_auth_path {
+        let auth = read_json(path).ok_or_else(|| anyhow!("read configured Pi auth file"))?;
+        let entry = auth
+            .get("openrouter")
+            .ok_or_else(|| anyhow!("Pi auth file has no OpenRouter credential"))?;
+        if entry.get("type").and_then(Value::as_str) == Some("api_key") {
+            if let Some(token) = entry.get("key").and_then(Value::as_str) {
+                if !token.trim().is_empty() {
+                    return Ok((OpenRouterScope::Key, token.trim().into()));
+                }
+            }
+        }
+        return Err(anyhow!("Pi auth file has no OpenRouter API key"));
+    }
+    Err(anyhow!(
+        "OpenRouter credential is unavailable; configure tokenEnv or tokenSecretRef"
+    ))
+}
+
+fn openrouter_headers(token: &str) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}"))?,
     );
-    if spec.management_key_env.is_some() {
-        let data = get_json("https://openrouter.ai/api/v1/credits", headers)?;
-        let total = data
-            .pointer("/data/total_credits")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| anyhow!("credits response omitted total_credits"))?;
-        let used = data
-            .pointer("/data/total_usage")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| anyhow!("credits response omitted total_usage"))?;
-        return Ok(vec![money_limit(
-            "balance",
-            (total - used).max(0.0),
-            Some(total),
-        )]);
+    Ok(headers)
+}
+
+fn parse_openrouter_key(data: &Value, expected: OpenRouterScope) -> Result<CollectedCapacity> {
+    let key = data
+        .get("data")
+        .ok_or_else(|| anyhow!("key response omitted data"))?;
+    let is_management = key
+        .get("is_management_key")
+        .and_then(Value::as_bool)
+        .or_else(|| key.get("is_provisioning_key").and_then(Value::as_bool));
+    if let Some(is_management) = is_management {
+        let actual = if is_management {
+            OpenRouterScope::Management
+        } else {
+            OpenRouterScope::Key
+        };
+        if actual != expected {
+            return Err(anyhow!(match expected {
+                OpenRouterScope::Key => {
+                    "configured ordinary OpenRouter credential is a management key; use managementKeyEnv or managementSecretRef"
+                }
+                OpenRouterScope::Management => {
+                    "configured OpenRouter management credential is an ordinary API key; use tokenEnv or tokenSecretRef"
+                }
+            }));
+        }
     }
-    let data = get_json("https://openrouter.ai/api/v1/key", headers)?;
-    let remaining = data
-        .pointer("/data/limit_remaining")
-        .and_then(Value::as_f64);
-    let total = data.pointer("/data/limit").and_then(Value::as_f64);
-    if let Some(remaining) = remaining {
-        let mut limit = money_limit("key limit", remaining, total);
+    let credential_label = key
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if expected == OpenRouterScope::Management {
+        return Ok(CollectedCapacity {
+            limits: Vec::new(),
+            credential_label,
+            capacity_scope: "account_credits".into(),
+        });
+    }
+
+    let remaining = key.get("limit_remaining").and_then(Value::as_f64);
+    let total = key.get("limit").and_then(Value::as_f64);
+    let reset_policy = key.get("limit_reset").and_then(Value::as_str);
+    let reset_detail = reset_policy
+        .map(|policy| format!("resets {policy}"))
+        .unwrap_or_default();
+    let limit = if let Some(remaining) = remaining {
+        let mut limit = money_limit("key spending limit", remaining, total);
         limit.remaining_percent = total
             .filter(|total| *total > 0.0)
             .map(|total| remaining / total * 100.0);
-        return Ok(vec![limit]);
+        limit.detail = reset_detail;
+        limit
+    } else {
+        CapacityLimit {
+            name: "key spending limit".into(),
+            kind: "unlimited".into(),
+            unit: "usd".into(),
+            remaining: None,
+            total,
+            remaining_percent: None,
+            resets_at: None,
+            status: LimitStatus::Unknown,
+            detail: [
+                "key is valid and unlimited at key scope; account-wide credits require a management key",
+                &reset_detail,
+            ]
+            .into_iter()
+            .filter(|detail| !detail.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+        }
+    };
+    Ok(CollectedCapacity {
+        limits: vec![limit],
+        credential_label,
+        capacity_scope: "key_spending_limit".into(),
+    })
+}
+
+fn parse_openrouter_credits(data: &Value, credential_label: String) -> Result<CollectedCapacity> {
+    let total = data
+        .pointer("/data/total_credits")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("credits response omitted total_credits"))?;
+    let used = data
+        .pointer("/data/total_usage")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("credits response omitted total_usage"))?;
+    let mut limit = money_limit("account credits", (total - used).max(0.0), Some(total));
+    limit.kind = "credits".into();
+    Ok(CollectedCapacity {
+        limits: vec![limit],
+        credential_label,
+        capacity_scope: "account_credits".into(),
+    })
+}
+
+fn collect_openrouter(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let (scope, token) = openrouter_credential(spec)?;
+    collect_openrouter_with(scope, &token, get_json)
+}
+
+fn redact_openrouter_error(error: anyhow::Error, token: &str) -> anyhow::Error {
+    anyhow!(format!("{error:#}").replace(token, "[redacted]"))
+}
+
+fn collect_openrouter_with(
+    scope: OpenRouterScope,
+    token: &str,
+    mut request: impl FnMut(&str, HeaderMap) -> Result<Value>,
+) -> Result<CollectedCapacity> {
+    let key_data = request(
+        "https://openrouter.ai/api/v1/key",
+        openrouter_headers(token)?,
+    )
+    .map_err(|error| redact_openrouter_error(error, token))?;
+    let key = parse_openrouter_key(&key_data, scope)?;
+    if scope == OpenRouterScope::Key {
+        return Ok(key);
     }
-    Ok(vec![CapacityLimit {
-        name: "key limit".into(),
-        kind: "balance".into(),
-        unit: "usd".into(),
-        remaining: None,
-        total,
-        remaining_percent: None,
-        resets_at: None,
-        status: LimitStatus::Unknown,
-        detail: "this key has no spending limit; use a management key for account credits".into(),
-    }])
+    let credits = request(
+        "https://openrouter.ai/api/v1/credits",
+        openrouter_headers(token)?,
+    )
+    .map_err(|error| redact_openrouter_error(error, token))?;
+    parse_openrouter_credits(&credits, key.credential_label)
 }
 
 fn money_limit(name: &str, remaining: f64, total: Option<f64>) -> CapacityLimit {
@@ -1219,11 +1457,11 @@ fn collect_amp(_spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     parse_amp_usage_at(&output, Utc::now())
 }
 
-fn collect_limits(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
+fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
     match spec.provider.as_str() {
-        "amp" => collect_amp(spec),
-        "anthropic" => collect_anthropic(spec),
-        "openai" => collect_openai(spec),
+        "amp" => collect_amp(spec).map(CollectedCapacity::limits),
+        "anthropic" => collect_anthropic(spec).map(CollectedCapacity::limits),
+        "openai" => collect_openai(spec).map(CollectedCapacity::limits),
         "openrouter" => collect_openrouter(spec),
         provider => Err(anyhow!("unknown provider: {provider}")),
     }
@@ -1235,18 +1473,18 @@ fn cache_path(spec: &AccountSpec) -> PathBuf {
 }
 
 fn collector_fingerprint(spec: &AccountSpec) -> String {
-    let secret = spec
-        .secret_ref
-        .as_ref()
-        .map(|reference| {
-            format!(
-                "{}\0{}\0{}",
-                reference.kind, reference.service, reference.account
-            )
-        })
-        .unwrap_or_default();
+    let secret_fingerprint = |reference: Option<&SecretRef>| {
+        reference
+            .map(|reference| {
+                format!(
+                    "{}\0{}\0{}",
+                    reference.kind, reference.service, reference.account
+                )
+            })
+            .unwrap_or_default()
+    };
     let material = format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         spec.provider,
         spec.auth_type,
         spec.source,
@@ -1268,7 +1506,9 @@ fn collector_fingerprint(spec: &AccountSpec) -> String {
             .map(expand_home)
             .unwrap_or_default()
             .display(),
-        secret
+        secret_fingerprint(spec.secret_ref.as_ref()),
+        secret_fingerprint(spec.token_secret_ref.as_ref()),
+        secret_fingerprint(spec.management_secret_ref.as_ref())
     );
     hex_lower(&Sha256::digest(material.as_bytes()))
 }
@@ -1294,13 +1534,15 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
         return cached.unwrap();
     }
     match collect_limits(spec) {
-        Ok(limits) => {
+        Ok(collected) => {
             let account = CapacityAccount {
                 provider: spec.provider.clone(),
                 account_id: spec.account_id.clone(),
                 label: spec.label.clone(),
                 auth_type: spec.auth_type.clone(),
-                limits,
+                credential_label: collected.credential_label,
+                capacity_scope: collected.capacity_scope,
+                limits: collected.limits,
                 fetched_at: Utc::now(),
                 error: String::new(),
                 collector_fingerprint: collector_fingerprint(spec),
@@ -1329,6 +1571,8 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
                     account_id: spec.account_id.clone(),
                     label: spec.label.clone(),
                     auth_type: spec.auth_type.clone(),
+                    credential_label: String::new(),
+                    capacity_scope: String::new(),
                     limits: vec![CapacityLimit {
                         name: "capacity".into(),
                         kind: "quota".into(),
@@ -1383,6 +1627,14 @@ fn provider_color(provider: &str) -> &'static str {
     }
 }
 
+fn capacity_scope_label(scope: &str) -> &str {
+    match scope {
+        "key_spending_limit" => "OpenRouter key spending limit",
+        "account_credits" => "account-wide OpenRouter credits",
+        _ => "",
+    }
+}
+
 fn render_bar(percent: f64, width: usize, warning: f64, critical: f64) -> String {
     let percent = clamp_percent(percent);
     let filled = (percent / 100.0 * width as f64).round() as usize;
@@ -1421,6 +1673,13 @@ fn format_reset(reset: Option<DateTime<Utc>>) -> String {
 }
 
 fn limit_summary(limit: &CapacityLimit) -> String {
+    if limit.kind == "unlimited" {
+        return if limit.status == LimitStatus::Stale {
+            "unlimited ~".into()
+        } else {
+            "unlimited".into()
+        };
+    }
     match limit.status {
         LimitStatus::Unavailable => "unavailable ⚠".into(),
         LimitStatus::Unknown => "unknown".into(),
@@ -1470,6 +1729,11 @@ fn render_limit(limit: &CapacityLimit, config: &Config, compact: bool, width: us
     } else {
         ""
     };
+    if limit.kind == "unlimited" {
+        let summary = limit_summary(limit);
+        let name_width = width.saturating_sub(summary.chars().count() + 1).max(1);
+        return format!("{} {summary}", pad_text(&limit.name, name_width));
+    }
     if matches!(
         limit.status,
         LimitStatus::Unknown | LimitStatus::Unavailable
@@ -1829,6 +2093,24 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
             ));
+            if !compact {
+                let scope = capacity_scope_label(&account.capacity_scope);
+                if !scope.is_empty() {
+                    lines.push(format!(
+                        "  \x1b[2m{}\x1b[0m",
+                        truncate_text(scope, width.saturating_sub(2))
+                    ));
+                }
+                if !account.credential_label.is_empty() {
+                    lines.push(format!(
+                        "  \x1b[2m{}\x1b[0m",
+                        truncate_text(
+                            &format!("key ID {}", account.credential_label),
+                            width.saturating_sub(2)
+                        )
+                    ));
+                }
+            }
             if account.provider == "amp" {
                 lines.extend(render_amp_limits(&account.limits, config, compact, width));
             } else {
@@ -2249,6 +2531,280 @@ mod tests {
     }
 
     #[test]
+    fn parses_limited_and_unlimited_openrouter_keys_with_safe_identity() {
+        let limited = parse_openrouter_key(
+            &json!({"data": {
+                "label": "sk-or-v1-…cafe",
+                "is_management_key": false,
+                "limit": 100.0,
+                "limit_remaining": 25.0,
+                "limit_reset": "monthly"
+            }}),
+            OpenRouterScope::Key,
+        )
+        .unwrap();
+        assert_eq!(limited.credential_label, "sk-or-v1-…cafe");
+        assert_eq!(limited.capacity_scope, "key_spending_limit");
+        assert_eq!(limited.limits[0].name, "key spending limit");
+        assert_eq!(limited.limits[0].remaining, Some(25.0));
+        assert_eq!(limited.limits[0].remaining_percent, Some(25.0));
+        assert_eq!(limited.limits[0].detail, "resets monthly");
+
+        let unlimited = parse_openrouter_key(
+            &json!({"data": {
+                "label": "sk-or-v1-…beef",
+                "is_management_key": false,
+                "limit": null,
+                "limit_remaining": null,
+                "limit_reset": null
+            }}),
+            OpenRouterScope::Key,
+        )
+        .unwrap();
+        assert_eq!(unlimited.limits[0].status, LimitStatus::Unknown);
+        assert_eq!(unlimited.limits[0].kind, "unlimited");
+        assert_eq!(limit_summary(&unlimited.limits[0]), "unlimited");
+        assert!(unlimited.limits[0]
+            .detail
+            .contains("key is valid and unlimited"));
+        assert!(unlimited.limits[0].detail.contains("management key"));
+
+        let optional_metadata_absent = parse_openrouter_key(
+            &json!({"data": {"limit": 5.0, "limit_remaining": 4.0}}),
+            OpenRouterScope::Key,
+        )
+        .unwrap();
+        assert!(optional_metadata_absent.credential_label.is_empty());
+        assert_eq!(optional_metadata_absent.limits[0].remaining, Some(4.0));
+    }
+
+    #[test]
+    fn management_key_reports_account_wide_credits() {
+        let mut requests = 0;
+        let collected = collect_openrouter_with(
+            OpenRouterScope::Management,
+            "management-secret",
+            |url, headers| {
+                requests += 1;
+                assert!(headers.get(AUTHORIZATION).is_some());
+                if url.ends_with("/key") {
+                    Ok(json!({"data": {
+                        "label": "sk-or-mgmt-…1234",
+                        "is_management_key": true
+                    }}))
+                } else {
+                    Ok(json!({"data": {"total_credits": 50.0, "total_usage": 12.5}}))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(requests, 2);
+        assert_eq!(collected.credential_label, "sk-or-mgmt-…1234");
+        assert_eq!(collected.capacity_scope, "account_credits");
+        assert_eq!(collected.limits[0].name, "account credits");
+        assert_eq!(collected.limits[0].remaining, Some(37.5));
+
+        let optional_metadata_absent =
+            parse_openrouter_key(&json!({"data": {}}), OpenRouterScope::Management).unwrap();
+        assert!(optional_metadata_absent.credential_label.is_empty());
+        assert_eq!(optional_metadata_absent.capacity_scope, "account_credits");
+    }
+
+    #[test]
+    fn openrouter_rejects_invalid_keys_and_scope_mismatches_without_echoing_secrets() {
+        let secret = "never-print-this-key";
+        let error = collect_openrouter_with(OpenRouterScope::Key, secret, |_url, _headers| {
+            Err(anyhow!("HTTP 401: invalid key {secret}"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("401"));
+        assert!(error.contains("invalid key"));
+        assert!(error.contains("[redacted]"));
+        assert!(!error.contains(secret));
+
+        let management_as_key = parse_openrouter_key(
+            &json!({"data": {"label": "masked", "is_management_key": true}}),
+            OpenRouterScope::Key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(management_as_key.contains("is a management key"));
+        let key_as_management = parse_openrouter_key(
+            &json!({"data": {"label": "masked", "is_management_key": false}}),
+            OpenRouterScope::Management,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(key_as_management.contains("ordinary API key"));
+        let deprecated_flag = parse_openrouter_key(
+            &json!({"data": {"is_provisioning_key": true}}),
+            OpenRouterScope::Key,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(deprecated_flag.contains("is a management key"));
+    }
+
+    #[test]
+    fn resolves_keychain_secrets_and_reports_lookup_and_platform_errors() {
+        let reference = SecretRef {
+            kind: "macos-keychain".into(),
+            service: "capacity-openrouter".into(),
+            account: "management".into(),
+        };
+        let secret =
+            resolve_secret_ref_with(&reference, true, |_| Ok(" secret-value\n".into())).unwrap();
+        assert_eq!(secret, "secret-value");
+
+        let spec: AccountSpec = serde_json::from_value(json!({
+            "provider": "openrouter",
+            "accountId": "default",
+            "label": "OpenRouter",
+            "managementSecretRef": {
+                "kind": "macos-keychain",
+                "service": "capacity-openrouter",
+                "account": "management"
+            }
+        }))
+        .unwrap();
+        let (scope, secret) =
+            openrouter_credential_with(&spec, |_| None, |_| Ok("management-secret".into()))
+                .unwrap();
+        assert_eq!(scope, OpenRouterScope::Management);
+        assert_eq!(secret, "management-secret");
+
+        let missing = resolve_secret_ref_with(&reference, true, |_| {
+            Err(anyhow!(
+                "no macOS Keychain item for the configured service and account"
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("no macOS Keychain item"));
+        assert!(
+            resolve_secret_ref_with(&reference, false, |_| unreachable!())
+                .unwrap_err()
+                .to_string()
+                .contains("require macOS")
+        );
+
+        let unsupported = SecretRef {
+            kind: "vault".into(),
+            ..reference
+        };
+        assert!(
+            resolve_secret_ref_with(&unsupported, true, |_| unreachable!())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported secret reference kind")
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_openrouter_sources_and_fingerprints_secret_selectors() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [{
+                "provider": "openrouter",
+                "accountId": "default",
+                "label": "OpenRouter",
+                "tokenEnv": "OPENROUTER_API_KEY",
+                "tokenSecretRef": {
+                    "kind": "macos-keychain",
+                    "service": "capacity-openrouter",
+                    "account": "ordinary"
+                }
+            }]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert!(specs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].error.contains("exactly one OpenRouter"));
+
+        let generic_ref: Config = serde_json::from_value(json!({
+            "accounts": [{
+                "provider": "openrouter",
+                "accountId": "wrong-ref",
+                "label": "OpenRouter",
+                "secretRef": {
+                    "kind": "macos-keychain",
+                    "service": "capacity-openrouter",
+                    "account": "ordinary"
+                }
+            }]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&generic_ref);
+        assert!(specs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]
+            .error
+            .contains("secretRef is not valid for OpenRouter"));
+
+        let mut first: AccountSpec = serde_json::from_value(json!({
+            "provider": "openrouter",
+            "accountId": "default",
+            "label": "OpenRouter",
+            "tokenSecretRef": {
+                "kind": "macos-keychain",
+                "service": "capacity-openrouter",
+                "account": "ordinary"
+            }
+        }))
+        .unwrap();
+        let original = collector_fingerprint(&first);
+        first.token_secret_ref.as_mut().unwrap().account = "other".into();
+        assert_ne!(original, collector_fingerprint(&first));
+    }
+
+    #[test]
+    fn openrouter_identity_and_scope_are_rendered_and_serialized() {
+        let collected = parse_openrouter_key(
+            &json!({"data": {
+                "label": "sk-or-v1-…cafe",
+                "is_management_key": false,
+                "limit": 10.0,
+                "limit_remaining": 8.0
+            }}),
+            OpenRouterScope::Key,
+        )
+        .unwrap();
+        let account = CapacityAccount {
+            provider: "openrouter".into(),
+            account_id: "default".into(),
+            label: "Personal OpenRouter".into(),
+            auth_type: "api".into(),
+            credential_label: collected.credential_label,
+            capacity_scope: collected.capacity_scope,
+            limits: collected.limits,
+            fetched_at: Utc::now(),
+            error: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        let pane = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            false,
+            80,
+        ));
+        assert!(pane.contains("Personal OpenRouter"));
+        assert!(pane.contains("OpenRouter key spending limit"));
+        assert!(pane.contains("key ID sk-or-v1-…cafe"));
+        let compact = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            true,
+            30,
+        ));
+        assert!(!compact.contains("key ID"));
+        assert!(!compact.contains("OpenRouter key spending limit"));
+        let probe = serde_json::to_value(account).unwrap();
+        assert_eq!(probe["credentialLabel"], "sk-or-v1-…cafe");
+        assert_eq!(probe["capacityScope"], "key_spending_limit");
+    }
+
+    #[test]
     fn renders_multiple_accounts_as_separate_capacity_lines() {
         let accounts = vec![
             test_account("personal", "Personal", 28.0),
@@ -2280,6 +2836,8 @@ mod tests {
             account_id: "billing".into(),
             label: "AMP billing".into(),
             auth_type: "cli".into(),
+            credential_label: String::new(),
+            capacity_scope: String::new(),
             limits,
             fetched_at: Utc::now(),
             error: String::new(),
@@ -2387,6 +2945,8 @@ mod tests {
             account_id: "billing".into(),
             label: "Very long Amp billing account label".into(),
             auth_type: "cli".into(),
+            credential_label: String::new(),
+            capacity_scope: String::new(),
             limits: vec![
                 money_limit("Workspace A very long workspace capacity name", 24.0, None),
                 CapacityLimit {
@@ -2561,6 +3121,8 @@ mod tests {
             account_id: id.into(),
             label: label.into(),
             auth_type: "oauth".into(),
+            credential_label: String::new(),
+            capacity_scope: String::new(),
             limits: vec![quota_limit("5h", Some(used), None)],
             fetched_at: Utc::now(),
             error: String::new(),
@@ -2581,6 +3143,8 @@ mod tests {
             codex_home: Some(codex_home.into()),
             token_env: None,
             management_key_env: None,
+            token_secret_ref: None,
+            management_secret_ref: None,
             pi_auth_path: None,
             amp_settings_path: None,
         }

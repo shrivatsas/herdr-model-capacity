@@ -571,7 +571,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         .config_dir
         .clone()
         .unwrap_or_else(|| home_dir().join(".claude"));
-    let oauth = claude_credentials(&dir, spec.allow_keychain || spec.config_dir.is_none())
+    let oauth = claude_credentials(&dir, spec.allow_keychain)
         .ok_or_else(|| anyhow!("no Claude OAuth credential in {}", dir.display()))?;
     let token = oauth
         .get("accessToken")
@@ -1518,6 +1518,24 @@ fn read_cached(spec: &AccountSpec) -> Option<CapacityAccount> {
     (account.collector_fingerprint == collector_fingerprint(spec)).then_some(account)
 }
 
+const MAX_STALE_CACHE_AGE: Duration = Duration::hours(24);
+
+fn stale_cache_is_usable(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(fetched_at);
+    age >= Duration::zero() && age <= MAX_STALE_CACHE_AGE
+}
+
+fn stale_age_label(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(fetched_at).num_seconds().max(0);
+    if seconds < 60 {
+        "now".into()
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
+    }
+}
+
 fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> CapacityAccount {
     let cached = read_cached(spec).map(|mut account| {
         account.provider.clone_from(&spec.provider);
@@ -1558,7 +1576,9 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
             account
         }
         Err(error) => {
-            if let Some(mut cached) = cached {
+            if let Some(mut cached) =
+                cached.filter(|account| stale_cache_is_usable(account.fetched_at, Utc::now()))
+            {
                 cached.error = format!("{error:#}");
                 for limit in &mut cached.limits {
                     limit.status = LimitStatus::Stale;
@@ -2079,16 +2099,20 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
             "─".repeat(width.saturating_sub(1).max(8))
         ));
         for account in group {
-            let stale = if account
+            let stale_age = if account
                 .limits
                 .iter()
                 .any(|limit| limit.status == LimitStatus::Stale)
             {
-                " \x1b[33m(stale)\x1b[0m"
+                Some(stale_age_label(account.fetched_at, Utc::now()))
             } else {
-                ""
+                None
             };
-            let label_width = width.saturating_sub(if stale.is_empty() { 1 } else { 9 });
+            let stale = stale_age
+                .as_ref()
+                .map_or_else(String::new, |age| format!(" \x1b[33m(stale {age})\x1b[0m"));
+            let stale_width = stale_age.map_or(0, |age| age.len() + 9);
+            let label_width = width.saturating_sub(stale_width);
             lines.push(format!(
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
@@ -2127,7 +2151,11 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                     }
                 }
             }
-            if !compact && !account.error.is_empty() {
+            let error_is_already_shown = account
+                .limits
+                .iter()
+                .any(|limit| limit.detail == account.error);
+            if !compact && !account.error.is_empty() && !error_is_already_shown {
                 lines.push(format!(
                     "  \x1b[2mlast refresh failed: {}\x1b[0m",
                     truncate_text(&account.error, width.saturating_sub(24))
@@ -2936,6 +2964,48 @@ mod tests {
         let output = render_limit(&limit, &Config::default(), false, 60);
         assert!(output.contains("unknown"));
         assert!(!output.contains("$0.00"));
+    }
+
+    #[test]
+    fn stale_cache_expires_after_a_day_and_reports_its_age() {
+        let now = DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(stale_cache_is_usable(now - Duration::hours(24), now));
+        assert!(!stale_cache_is_usable(
+            now - Duration::hours(24) - Duration::seconds(1),
+            now
+        ));
+        assert!(!stale_cache_is_usable(now + Duration::seconds(1), now));
+        assert_eq!(stale_age_label(now - Duration::seconds(30), now), "now");
+        assert_eq!(stale_age_label(now - Duration::minutes(5), now), "5m");
+        assert_eq!(stale_age_label(now - Duration::hours(3), now), "3h");
+    }
+
+    #[test]
+    fn fresh_failure_error_is_not_rendered_twice() {
+        let error = "no Claude OAuth credential in /missing";
+        let mut account = test_account("personal", "Personal", 28.0);
+        account.limits[0].status = LimitStatus::Unavailable;
+        account.limits[0].detail = error.into();
+        account.error = error.into();
+        let output = strip_ansi(&render(&Config::default(), &[account], false, 80));
+        assert_eq!(output.matches(error).count(), 1);
+        assert!(!output.contains("last refresh failed"));
+    }
+
+    #[test]
+    fn keychain_is_opt_in_even_without_a_claude_config_directory() {
+        let spec: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "personal",
+            "label": "Personal",
+            "authType": "oauth",
+            "source": "claude-code"
+        }))
+        .unwrap();
+        assert!(spec.config_dir.is_none());
+        assert!(!spec.allow_keychain);
     }
 
     #[test]

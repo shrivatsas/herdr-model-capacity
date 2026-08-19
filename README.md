@@ -10,17 +10,18 @@ Model Capacity
 CLAUDE
 ───────────────────────────────────
 Personal subscription
-  5h           ███████████  72%  ↻ 2h12m
-  7d           ███████      48%  ↻ 4d8h
+  5h           ███████████░░░░  72%  ↻ 2h12m
+  7d           ███████░░░░░░░░  48%  ↻ 4d8h
 
 CHATGPT / OPENAI
 ───────────────────────────────────
 Work subscription
-  7d           █████████████ 82%
+  7d           █████████████░░ 82%
 ```
 
 Configured accounts remain visible when collection fails. A previous successful
-value is marked stale; an account with no cached value is shown as unavailable.
+value is marked stale with its age (for up to 24 hours); an account with no
+usable cached value is shown as unavailable.
 Unknown and unsupported capacity is never rendered as zero.
 
 ## Architecture
@@ -33,7 +34,7 @@ normalizes and renders.
 flowchart TD
     A["<b>Herdr host</b><br/>actions · panes · keybindings"]
 
-    A -->|"open-capacity action"| B["<b>bin/open-capacity.sh</b><br/>per-workspace toggle<br/>state file + lock dir"]
+    A -->|"open-capacity action"| B["<b>bin/open-capacity.sh</b><br/>per-workspace toggle<br/>state file + lock file"]
     B -->|"plugin pane open / close"| A
     A -->|"pane entrypoint"| C["bin/run-capacity.sh"]
     C --> D["<b>bin/model-capacity</b><br/>Rust binary"]
@@ -91,7 +92,7 @@ sequenceDiagram
             else failure or timeout
                 S-->>X: error
                 X-->>P: error
-                Note over P: previous value → stale (~)<br/>no previous value → unavailable ⚠<br/>never rendered as zero
+                Note over P: previous value ≤24h old → stale (age + ~)<br/>otherwise → unavailable ⚠<br/>never rendered as zero
             end
         end
     end
@@ -114,9 +115,9 @@ toggling:
 herdr plugin install shrivatsas/herdr-model-capacity
 ```
 
-The default action toggles a non-focused split on the right. It finds the
-plugin's pane in the current workspace, closes it if present, and otherwise
-opens one:
+The default action toggles a non-focused split on the right. It records the
+pane ID it opens in a per-workspace state file, closes that recorded pane if it
+is still present, and otherwise opens one:
 
 ```bash
 herdr plugin action invoke shrivatsa.model-capacity.open-capacity
@@ -129,6 +130,12 @@ they can also switch orientation:
 herdr plugin action invoke shrivatsa.model-capacity.open-capacity-right
 herdr plugin action invoke shrivatsa.model-capacity.open-capacity-down
 ```
+
+Herdr's pane-list response does not identify a plugin pane by plugin or
+entrypoint. If Herdr opens a pane but omits its pane ID from the open response,
+the script cannot safely discover or close that orphan later; it reports the
+failure instead of guessing from unrelated panes. Close that pane in Herdr,
+then invoke the action again.
 
 Example keybindings:
 
@@ -280,7 +287,9 @@ render the 403 as zero or infer quota from inference success.
 
 The OAuth usage endpoint used for the standard Claude Code credential is not a
 documented public API. Successful values are cached; failures retain stale
-values. Ordinary Anthropic API keys do not expose a credit-balance endpoint.
+values for at most 24 hours and label their age. `allowKeychain` is always an
+explicit opt-in, including when `configDir` is omitted. Ordinary Anthropic API
+keys do not expose a credit-balance endpoint.
 
 ### OpenRouter
 

@@ -269,34 +269,6 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
         .cloned()
 }
 
-fn keychain_item_exists(reference: &SecretRef) -> Result<()> {
-    if reference.kind != "macos-keychain" {
-        return Err(anyhow!(
-            "unsupported secret reference kind: {}",
-            reference.kind
-        ));
-    }
-    if !cfg!(target_os = "macos") {
-        return Err(anyhow!("macOS Keychain secret references require macOS"));
-    }
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            &reference.service,
-            "-a",
-            &reference.account,
-        ])
-        .output()
-        .context("read macOS Keychain secret")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "no macOS Keychain item for the configured service and account"
-        ));
-    }
-    Ok(())
-}
-
 fn resolve_secret_ref(reference: &SecretRef) -> Result<String> {
     resolve_secret_ref_with(reference, cfg!(target_os = "macos"), |reference| {
         let output = Command::new("security")
@@ -379,6 +351,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
 
 fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccount>) {
     let mut seen = HashSet::new();
+    let mut seen_anthropic_secret_refs = HashSet::new();
     let mut amp_configured = false;
     let mut result = Vec::new();
     let mut errors = Vec::new();
@@ -423,6 +396,23 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
                 continue;
             }
             amp_configured = true;
+        }
+        if account.provider == "anthropic" {
+            if let Some(reference) = &account.secret_ref {
+                let identity = (
+                    reference.kind.clone(),
+                    reference.service.clone(),
+                    reference.account.clone(),
+                );
+                if !seen_anthropic_secret_refs.insert(identity) {
+                    let detail = format!(
+                        "duplicate Keychain reference: {}/{} is already registered under another account and cannot become a separate subscription",
+                        reference.service, reference.account
+                    );
+                    errors.push(unavailable_account(&account, detail));
+                    continue;
+                }
+            }
         }
         if account.provider == "openrouter" {
             if account.secret_ref.is_some() {
@@ -555,21 +545,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         ));
     }
     if let Some(reference) = &spec.secret_ref {
-        // setup-token credentials can authenticate Claude Code inference, but the
-        // official OAuth usage endpoint rejects them. Verify the reference exists
-        // without exposing the token, then report that capability honestly.
-        keychain_item_exists(reference)?;
-        return Ok(vec![CapacityLimit {
-            name: "subscription quota".into(),
-            kind: "quota".into(),
-            unit: "percent".into(),
-            remaining: None,
-            total: None,
-            remaining_percent: None,
-            resets_at: None,
-            status: LimitStatus::Unknown,
-            detail: "setup-token authentication works for inference, but Claude's quota endpoint does not authorize this credential type".into(),
-        }]);
+        return collect_anthropic_secret_ref_with(reference, resolve_secret_ref, get_json);
     }
     let dir = spec
         .config_dir
@@ -577,6 +553,54 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         .unwrap_or_else(|| home_dir().join(".claude"));
     let oauth = claude_credentials(&dir, spec.allow_keychain)
         .ok_or_else(|| anyhow!("no Claude OAuth credential in {}", dir.display()))?;
+    claude_oauth_usage_with(&oauth, get_json)
+}
+
+/// A named Keychain credential may hold either a copy of a Claude Code OAuth
+/// payload (independently collectible, same as the standard credential) or a
+/// setup-token-style secret that authenticates inference but is rejected by
+/// the OAuth usage endpoint. The two are distinguished by shape, never by
+/// guessing from the account/service selector.
+fn collect_anthropic_secret_ref_with(
+    reference: &SecretRef,
+    secret_lookup: impl FnOnce(&SecretRef) -> Result<String>,
+    request: impl FnMut(&str, HeaderMap) -> Result<Value>,
+) -> Result<Vec<CapacityLimit>> {
+    let secret = secret_lookup(reference)?;
+    match parse_claude_oauth_secret(&secret) {
+        Some(oauth) => claude_oauth_usage_with(&oauth, request),
+        None => Ok(vec![unsupported_claude_credential_limit()]),
+    }
+}
+
+fn parse_claude_oauth_secret(secret: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(secret).ok()?;
+    let oauth = value.get("claudeAiOauth").cloned().unwrap_or(value);
+    oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .is_some()
+        .then_some(oauth)
+}
+
+fn unsupported_claude_credential_limit() -> CapacityLimit {
+    CapacityLimit {
+        name: "subscription quota".into(),
+        kind: "quota".into(),
+        unit: "percent".into(),
+        remaining: None,
+        total: None,
+        remaining_percent: None,
+        resets_at: None,
+        status: LimitStatus::Unknown,
+        detail: "named Claude credential is not an OAuth-shaped payload; setup-token and other credential types authenticate inference but are not authorized by Claude's quota endpoint".into(),
+    }
+}
+
+fn claude_oauth_usage_with(
+    oauth: &Value,
+    mut request: impl FnMut(&str, HeaderMap) -> Result<Value>,
+) -> Result<Vec<CapacityLimit>> {
     let token = oauth
         .get("accessToken")
         .and_then(Value::as_str)
@@ -595,7 +619,18 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         HeaderName::from_static("anthropic-beta"),
         HeaderValue::from_static("oauth-2025-04-20"),
     );
-    let data = get_json("https://api.anthropic.com/api/oauth/usage", headers)?;
+    let data = request("https://api.anthropic.com/api/oauth/usage", headers)
+        .map_err(|error| redact_claude_error(error, token))?;
+    Ok(parse_claude_usage(&data))
+}
+
+/// Provider error bodies are not a trusted boundary: redact the bearer token
+/// before an error can be persisted to the cache or rendered in the pane.
+fn redact_claude_error(error: anyhow::Error, token: &str) -> anyhow::Error {
+    anyhow!(format!("{error:#}").replace(token, "[redacted]"))
+}
+
+fn parse_claude_usage(data: &Value) -> Vec<CapacityLimit> {
     let mut limits = Vec::new();
     if let Some(items) = data.get("limits").and_then(Value::as_array) {
         for item in items {
@@ -630,7 +665,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
             ));
         }
     }
-    Ok(limits)
+    limits
 }
 
 fn window_name(window: &Value, fallback: &str) -> String {
@@ -2815,6 +2850,190 @@ mod tests {
                 .to_string()
                 .contains("unsupported secret reference kind")
         );
+    }
+
+    #[test]
+    fn parses_claude_usage_limits_array_and_five_hour_seven_day_fallback() {
+        let limits = parse_claude_usage(&json!({
+            "limits": [
+                {"kind": "session", "percent": 28},
+                {"kind": "weekly_all", "percent": 52, "resets_in_seconds": 3600}
+            ]
+        }));
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| (limit.name.as_str(), limit.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![("5h", Some(72.0)), ("7d", Some(48.0))]
+        );
+
+        let fallback = parse_claude_usage(&json!({
+            "five_hour": {"utilization": 10.0},
+            "seven_day": {"utilization": 90.0}
+        }));
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|limit| (limit.name.as_str(), limit.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![("5h", Some(90.0)), ("7d", Some(10.0))]
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_distinguishes_success_expired_and_endpoint_rejection() {
+        let oauth = json!({"accessToken": "token", "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()});
+        let success = claude_oauth_usage_with(&oauth, |_url, headers| {
+            assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer token");
+            Ok(json!({"five_hour": {"utilization": 20.0}, "seven_day": {"utilization": 40.0}}))
+        })
+        .unwrap();
+        assert_eq!(success[0].remaining_percent, Some(80.0));
+
+        let expired_oauth = json!({"accessToken": "token", "expiresAt": (Utc::now() - Duration::hours(1)).to_rfc3339()});
+        let expired = claude_oauth_usage_with(&expired_oauth, |_url, _headers| unreachable!())
+            .unwrap_err()
+            .to_string();
+        assert!(expired.contains("expired"));
+
+        let rejected = claude_oauth_usage_with(&oauth, |_url, _headers| {
+            Err(anyhow!("HTTP 403: OAuth token unauthorized for token"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(rejected.contains("403"));
+        assert!(rejected.contains("[redacted]"));
+        assert!(!rejected.contains("token"));
+    }
+
+    #[test]
+    fn standard_and_named_claude_credentials_collect_independently_with_distinct_reasons() {
+        // Housemed: the standard `Claude Code-credentials` Keychain item, modeled
+        // as the OAuth payload `claude_credentials` would hand to the collector.
+        let housemed_oauth = json!({
+            "accessToken": "housemed-token",
+            "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
+        });
+        let housemed_limits = claude_oauth_usage_with(&housemed_oauth, |_url, _headers| {
+            Ok(json!({"five_hour": {"utilization": 30.0}, "seven_day": {"utilization": 10.0}}))
+        })
+        .unwrap();
+        assert_eq!(housemed_limits[0].remaining_percent, Some(70.0));
+
+        // shrivatsa-dev: a named Keychain item under
+        // herdr-model-capacity-claude/shrivatsa-dev holding an OAuth-shaped
+        // credential, collected independently from Housemed.
+        let named = SecretRef {
+            kind: "macos-keychain".into(),
+            service: "herdr-model-capacity-claude".into(),
+            account: "shrivatsa-dev".into(),
+        };
+        let shrivatsa_dev_limits = collect_anthropic_secret_ref_with(
+            &named,
+            |_| {
+                Ok(json!({"claudeAiOauth": {
+                    "accessToken": "shrivatsa-dev-token",
+                    "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
+                }})
+                .to_string())
+            },
+            |_url, _headers| {
+                Ok(json!({"five_hour": {"utilization": 5.0}, "seven_day": {"utilization": 15.0}}))
+            },
+        )
+        .unwrap();
+        assert_eq!(shrivatsa_dev_limits[0].remaining_percent, Some(95.0));
+
+        // A genuine setup-token-shaped secret is reported as unsupported, never
+        // as zero, and never re-attempts the network.
+        let setup_token = collect_anthropic_secret_ref_with(
+            &named,
+            |_| Ok("cc-setup-token-not-oauth-shaped".into()),
+            |_url, _headers| unreachable!("setup-token credentials must not call the endpoint"),
+        )
+        .unwrap();
+        assert_eq!(setup_token.len(), 1);
+        assert_eq!(setup_token[0].status, LimitStatus::Unknown);
+        assert!(setup_token[0].remaining_percent.is_none());
+        assert!(setup_token[0]
+            .detail
+            .contains("not an OAuth-shaped payload"));
+        assert!(!setup_token[0]
+            .detail
+            .contains("cc-setup-token-not-oauth-shaped"));
+    }
+
+    #[test]
+    fn distinct_anthropic_accounts_get_unique_cache_keys_and_independent_fingerprints() {
+        let housemed: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "housemed",
+            "label": "Housemed",
+            "authType": "oauth",
+            "allowKeychain": true
+        }))
+        .unwrap();
+        let mut shrivatsa_dev: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "shrivatsa-dev",
+            "label": "shrivatsa-dev",
+            "authType": "oauth",
+            "secretRef": {
+                "kind": "macos-keychain",
+                "service": "herdr-model-capacity-claude",
+                "account": "shrivatsa-dev"
+            }
+        }))
+        .unwrap();
+
+        assert_ne!(cache_path(&housemed), cache_path(&shrivatsa_dev));
+        let housemed_fingerprint = collector_fingerprint(&housemed);
+        let original_shrivatsa_dev_fingerprint = collector_fingerprint(&shrivatsa_dev);
+        assert_ne!(housemed_fingerprint, original_shrivatsa_dev_fingerprint);
+
+        // Changing shrivatsa-dev's credential reference invalidates only its own
+        // cache entry; Housemed refreshes independently.
+        shrivatsa_dev.secret_ref.as_mut().unwrap().account = "personal".into();
+        assert_ne!(
+            collector_fingerprint(&shrivatsa_dev),
+            original_shrivatsa_dev_fingerprint
+        );
+        assert_eq!(collector_fingerprint(&housemed), housemed_fingerprint);
+    }
+
+    #[test]
+    fn duplicate_keychain_reference_does_not_become_a_third_subscription() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [
+                {
+                    "provider": "anthropic",
+                    "accountId": "shrivatsa-dev",
+                    "label": "shrivatsa-dev",
+                    "secretRef": {
+                        "kind": "macos-keychain",
+                        "service": "herdr-model-capacity-claude",
+                        "account": "shrivatsa-dev"
+                    }
+                },
+                {
+                    "provider": "anthropic",
+                    "accountId": "personal",
+                    "label": "Personal",
+                    "secretRef": {
+                        "kind": "macos-keychain",
+                        "service": "herdr-model-capacity-claude",
+                        "account": "shrivatsa-dev"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].account_id, "shrivatsa-dev");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].error.contains("duplicate Keychain reference"));
     }
 
     #[test]

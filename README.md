@@ -191,24 +191,22 @@ used to help author it, but never defines dashboard accounts.
     },
     {
       "provider": "anthropic",
-      "accountId": "work-claude",
-      "label": "Work Claude subscription",
+      "accountId": "housemed",
+      "label": "Housemed",
       "authType": "oauth",
       "source": "claude-code",
-      "configDir": "~/.claude-accounts/work",
       "allowKeychain": true
     },
     {
       "provider": "anthropic",
-      "accountId": "personal-claude",
-      "label": "Personal Claude subscription",
+      "accountId": "shrivatsa-dev",
+      "label": "shrivatsa-dev",
       "authType": "oauth",
       "source": "claude-code",
-      "configDir": "~/.claude-accounts/personal",
       "secretRef": {
         "kind": "macos-keychain",
-        "service": "example-herdr-claude",
-        "account": "personal"
+        "service": "herdr-model-capacity-claude",
+        "account": "shrivatsa-dev"
       }
     },
     {
@@ -277,21 +275,62 @@ account is displayed as unknown rather than using historical organization cost.
 
 Claude Code's normal macOS login uses one shared `Claude Code-credentials`
 Keychain item. `CLAUDE_CONFIG_DIR` alone therefore does not isolate multiple
-subscription logins. `allowKeychain` enables that standard item for an account.
+subscription logins. `allowKeychain` enables that standard item for an
+account — this is the only account that should read the standard item.
 
-For a credential created with official `claude setup-token`, use a
-`macos-keychain` `secretRef`. The plugin asks `security` for the named service
-and account and never writes or logs the returned value. Setup tokens can pass
-Claude authentication and inference while still receiving HTTP 403 from
-Claude's OAuth usage endpoint. The plugin therefore verifies that the reference
-exists and shows **quota unsupported for this credential type**; it does not
-render the 403 as zero or infer quota from inference success.
+A second macOS subscription needs a **named** Keychain item selected by a
+`macos-keychain` `secretRef`. The plugin asks `security` for the configured
+service and account and never writes, logs, or renders the returned value.
+What that item holds decides how it is collected:
 
-The OAuth usage endpoint used for the standard Claude Code credential is not a
-documented public API. Successful values are cached; failures retain stale
-values for at most 24 hours and label their age. `allowKeychain` is always an
-explicit opt-in, including when `configDir` is omitted. Ordinary Anthropic API
-keys do not expose a credit-balance endpoint.
+- If it holds the same OAuth-shaped payload Claude Code writes to the
+  standard item (a `claudeAiOauth` object, or that object's fields directly
+  — `accessToken`, `expiresAt`, etc.), the plugin authenticates the official
+  `api.anthropic.com/api/oauth/usage` endpoint with it and collects live
+  quota for that second subscription **independently** of the standard
+  account. Create it by copying the second account's own signed-in
+  credential out of the standard item into a distinct service/account pair,
+  for example:
+
+  ```bash
+  # After signing the second subscription into Claude Code so it is the
+  # one currently in "Claude Code-credentials":
+  security add-generic-password -U -s herdr-model-capacity-claude -a shrivatsa-dev \
+    -w "$(security find-generic-password -s "Claude Code-credentials" -w)"
+  ```
+
+  Re-run this whenever that subscription's token is refreshed by signing
+  back into it in Claude Code; the plugin never refreshes or writes back to
+  Keychain itself.
+
+- If it holds an official `claude setup-token` credential (or any other
+  non-OAuth-shaped secret), that token can still pass Claude authentication
+  and inference, but Claude's OAuth usage endpoint does not authorize it.
+  The plugin never guesses this from the account/service name — it looks at
+  the resolved payload's shape — and shows **quota unsupported for this
+  credential type** rather than treating the eventual HTTP 403 as zero.
+
+Two accounts with an identical `secretRef` (same `service` and `account`) are
+rejected as a duplicate Keychain reference rather than shown as a third
+subscription — do not add a second account entry pointing at a Keychain item
+that already duplicates a registered subscription (for example, a stray
+`personal` item left over from an earlier setup).
+
+The OAuth usage endpoint is not a documented public API, and expired tokens
+are reported as expired rather than retried as generic failures. Successful
+values are cached; failures retain stale values for at most 24 hours and label
+their age. Each account refreshes independently — editing one account's
+`configDir`, `allowKeychain`, or `secretRef` only invalidates that account's
+cache. `allowKeychain` is always an explicit opt-in, including when
+`configDir` is omitted. Ordinary Anthropic API keys do not expose a
+credit-balance endpoint.
+
+This named-Keychain path is macOS-only, requires the `security` CLI, and
+only recognizes the two payload shapes above; a malformed JSON blob or an
+OAuth object missing `accessToken` falls back to the unsupported-credential-
+type result rather than an error that looks like an outage. A missing
+Keychain item, a non-`macos-keychain` `secretRef` kind, or an expired OAuth
+token remain distinct configuration/auth errors instead.
 
 ### OpenRouter
 

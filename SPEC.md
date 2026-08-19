@@ -4,11 +4,13 @@
 > direction. The shipped v1 decisions are narrower: the explicit account
 > registry is authoritative; the normal pane is account-only; agent linkage is
 > optional and disabled by default; ChatGPT quota is collected only through
-> `codex app-server --stdio` for each configured `CODEX_HOME`; and Claude
-> setup-token credentials referenced through macOS Keychain are shown as
-> quota-unsupported because the OAuth usage endpoint rejects that credential
-> type. The persistent pane defaults to a right split and can be replaced with a
-> down split. README.md is the normative setup and security documentation.
+> `codex app-server --stdio` for each configured `CODEX_HOME`; and a second
+> Claude subscription is referenced through a named macOS Keychain
+> `secretRef` — collected live and independently when that item holds an
+> OAuth-shaped credential, and shown as quota-unsupported when it holds a
+> setup-token or other credential type the OAuth usage endpoint rejects. The
+> persistent pane defaults to a right split and can be replaced with a down
+> split. README.md is the normative setup and security documentation.
 
 ## Goal
 

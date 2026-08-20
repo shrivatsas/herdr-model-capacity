@@ -400,18 +400,30 @@ stdin, color disabled, and a 10-second overall timeout.
 
 The parser supports the current version-1 text forms for Amp Free dollar or
 daily-percent capacity, separate subscription “other” and “orb” lanes,
-individual credits, and multiple workspace balances. Dollar balances render as
-dollars. A subscription renewal timestamp is only approximated when the CLI
-reports a number of days; “resets daily” is retained as detail without inventing
-an exact timestamp. Identity lines and trailing CLI advice are ignored, and the
-registry's `accountId` and `label` remain authoritative.
+individual credits, and multiple workspace balances. Both the plain
+(`Subscription <plan>: …`, `Individual credits: …`) and current Markdown-bold
+(`**<plan> Subscription:** …`, `**Individual credits:** …`) label forms are
+accepted. Dollar balances render as dollars. A subscription renewal timestamp
+is only approximated when the CLI reports a number of days; “resets daily” is
+retained as detail without inventing an exact timestamp. Identity lines,
+trailing CLI advice (including the `# Run amp usage --details` hint), and the
+raw output are ignored, and the registry's `accountId` and `label` remain
+authoritative.
+
+If `amp usage` output includes lines the parser does not recognize alongside
+successfully parsed limits, those limits stay visible and the card shows a
+generic, non-sensitive warning that some output was not understood—raw output
+is never rendered or persisted. A malformed known capacity line (for example, a
+changed `Workspace` or subscription line) is dropped rather than kept with a
+possibly wrong value. Only when nothing at all can be parsed, or the CLI
+reports a signed-out identity, does the card become unavailable.
 
 Amp CLI currently exposes one authenticated identity to `amp usage`, so only one
 Amp billing account may be configured. A missing CLI, signed-out identity,
-timeout, command error, or unrecognized capacity text makes a never-fetched card
-unavailable and retains a previous successful value as stale—never as zero.
-Because `amp usage` is a human-readable, versioned text contract, a future CLI
-wording change may require a parser update.
+timeout, command error, or fully unrecognized capacity text makes a
+never-fetched card unavailable and retains a previous successful value as
+stale—never as zero. Because `amp usage` is a human-readable, versioned text
+contract, a future CLI wording change may require a parser update.
 
 ## Security model
 
@@ -421,7 +433,9 @@ wording change may require a parser update.
 - Amp CLI is the sole owner of Amp authentication; Amp credentials and raw
   identity output are not stored.
 - Provider responses cached under the plugin state directory contain normalized
-  limits, safe masked OpenRouter key labels, and errors—not credentials.
+  limits, safe masked OpenRouter key labels, and errors—not credentials. An
+  Amp partial-parse warning is a fixed, generic message and never includes raw
+  provider output or identity text.
 - Diagnostics do not include secret values.
 
 ## Development

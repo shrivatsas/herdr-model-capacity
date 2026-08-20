@@ -640,6 +640,17 @@ so the registry accepts only one Amp billing account. The registry never stores
 credentials and parsed identity text never supplies the account label.
 The version-1 text parser normalizes Amp Free dollar and daily-percent forms,
 subscription other/orb lanes, individual credits, and every reported workspace
-balance. Renewal resets are approximate and are derived only from a reported
-day count. Missing CLI/authentication, command failure, timeout, or text drift
-uses the standard unavailable/stale behavior and never synthesizes zero.
+balance, accepting both the plain and current Markdown-bold (`**…:**`) label
+forms plus the `# Run amp usage --details` advice line. Renewal resets are
+approximate and are derived only from a reported day count. Missing
+CLI/authentication, command failure, timeout, or fully unrecognized text uses
+the standard unavailable/stale behavior and never synthesizes zero.
+
+When some but not all Amp usage lines are recognized, successfully parsed
+limits stay visible and `CapacityAccount.warning` carries a fixed, generic
+notice ("...not understood...") instead of discarding the whole account—raw
+output and identity text are never captured in the warning, cache, or probe
+JSON. A known capacity line that changed shape (for example, a malformed
+`Workspace` or subscription line) is dropped rather than kept with a possibly
+wrong value. A signed-out/authentication response still yields the standard
+unavailable error rather than a partial success.

@@ -1163,15 +1163,22 @@ fn amp_money_limit(name: &str, remaining: &str, total: Option<&str>) -> Option<C
     Some(limit)
 }
 
+/// The exact contracted `amp usage --details` advisory line. Lines are
+/// trimmed before this comparison (see `parse_amp_usage_at`'s per-line
+/// `str::trim`), so this only needs to match the trimmed contract text
+/// itself, not a prefix: an unrecognized `# Run ...` line must still count
+/// as unrecognized output rather than being silently swallowed as metadata.
+const AMP_USAGE_DETAILS_ADVICE: &str = "# Run `amp usage --details` for more detailed information.";
+
 fn amp_metadata_line(line: &str) -> bool {
     line.is_empty()
+        || line == AMP_USAGE_DETAILS_ADVICE
         || [
             "Signed in",
             "Logged in as ",
             "Account: ",
             "Learn more:",
             "Manage billing:",
-            "# Run ",
         ]
         .iter()
         .any(|prefix| line.starts_with(prefix))
@@ -1185,9 +1192,15 @@ fn amp_metadata_line(line: &str) -> bool {
 /// so it cannot be treated as unconditional proof of a signed-out session.
 fn amp_signed_out_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    ["not signed in", "not logged in", "sign in to amp"]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    [
+        "not signed in",
+        "not logged in",
+        "sign in to amp",
+        "authentication required",
+        "authentication failed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn valid_amp_advice_suffix(suffix: &str) -> bool {
@@ -2623,6 +2636,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("signed out"));
+    }
+
+    #[test]
+    fn amp_authentication_failure_marker_wins_even_with_a_parsed_looking_limit_line() {
+        let error = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\nAuthentication required. Run amp login.",
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("signed out"));
+    }
+
+    #[test]
+    fn amp_usage_keeps_parsed_limits_visible_when_a_line_is_an_unrecognized_run_advice() {
+        let usage = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\n# Run something-new for more info.",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(usage.limits.len(), 1);
+        assert_eq!(usage.limits[0].remaining, Some(5.00));
+        assert_eq!(usage.warning.as_deref(), Some(AMP_PARTIAL_WARNING));
     }
 
     #[test]

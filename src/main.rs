@@ -1231,11 +1231,15 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
     let mut parsed_lines = 0;
     let mut signed_out = false;
     for line in output.lines().map(str::trim) {
-        if amp_metadata_line(line) {
-            continue;
-        }
+        // Checked before metadata classification: a conclusive signed-out or
+        // authentication-failure marker must win even on a line that also
+        // matches a metadata prefix like "Logged in as ", so metadata
+        // classification can never suppress it.
         if amp_signed_out_line(line) {
             signed_out = true;
+            continue;
+        }
+        if amp_metadata_line(line) {
             continue;
         }
         contract_lines += 1;
@@ -2642,6 +2646,16 @@ mod tests {
     fn amp_authentication_failure_marker_wins_even_with_a_parsed_looking_limit_line() {
         let error = parse_amp_usage_at(
             "Individual credits: $5.00 remaining\nAuthentication required. Run amp login.",
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("signed out"));
+    }
+
+    #[test]
+    fn amp_metadata_shaped_authentication_failure_still_wins_over_a_parsed_looking_limit_line() {
+        let error = parse_amp_usage_at(
+            "Logged in as stale@example.invalid — authentication failed\nIndividual credits: $5.00 remaining",
             Utc::now(),
         )
         .unwrap_err();

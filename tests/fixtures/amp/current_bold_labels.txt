@@ -1,0 +1,6 @@
+Signed in as person@example.invalid
+
+**Amp Megawatt Subscription:** 0% other usage and 100% orb usage remaining - resets upon renewal in 18 days
+**Individual credits:** $2.95 remaining (set up auto-reload to avoid running out) - https://example.invalid/settings
+
+# Run `amp usage --details` for more detailed information.

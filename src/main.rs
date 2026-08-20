@@ -75,6 +75,11 @@ struct CapacityAccount {
     fetched_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     error: String,
+    /// A non-fatal parse-contract warning (e.g. unrecognized Amp usage lines).
+    /// Never derived from raw provider output, so it is safe to persist to
+    /// cache and probe JSON alongside successfully parsed limits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    warning: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     collector_fingerprint: String,
 }
@@ -124,6 +129,7 @@ struct CollectedCapacity {
     limits: Vec<CapacityLimit>,
     credential_label: String,
     capacity_scope: String,
+    warning: String,
 }
 
 impl CollectedCapacity {
@@ -132,6 +138,7 @@ impl CollectedCapacity {
             limits,
             credential_label: String::new(),
             capacity_scope: String::new(),
+            warning: String::new(),
         }
     }
 }
@@ -345,6 +352,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
         }],
         fetched_at: Utc::now(),
         error: detail,
+        warning: String::new(),
         collector_fingerprint: String::new(),
     }
 }
@@ -1002,6 +1010,7 @@ fn parse_openrouter_key(data: &Value, expected: OpenRouterScope) -> Result<Colle
             limits: Vec::new(),
             credential_label,
             capacity_scope: "account_credits".into(),
+            warning: String::new(),
         });
     }
 
@@ -1042,6 +1051,7 @@ fn parse_openrouter_key(data: &Value, expected: OpenRouterScope) -> Result<Colle
         limits: vec![limit],
         credential_label,
         capacity_scope: "key_spending_limit".into(),
+        warning: String::new(),
     })
 }
 
@@ -1060,6 +1070,7 @@ fn parse_openrouter_credits(data: &Value, credential_label: String) -> Result<Co
         limits: vec![limit],
         credential_label,
         capacity_scope: "account_credits".into(),
+        warning: String::new(),
     })
 }
 
@@ -1160,6 +1171,7 @@ fn amp_metadata_line(line: &str) -> bool {
             "Account: ",
             "Learn more:",
             "Manage billing:",
+            "# Run ",
         ]
         .iter()
         .any(|prefix| line.starts_with(prefix))
@@ -1189,7 +1201,19 @@ fn valid_amp_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(char::is_control)
 }
 
-fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLimit>> {
+/// A generic, non-sensitive notice shown when Amp usage output contained text
+/// the parser did not understand. Never derived from the raw output, so it is
+/// safe to render and to persist in cache/probe JSON.
+const AMP_PARTIAL_WARNING: &str =
+    "Amp usage output included lines that were not understood; some balances may be missing.";
+
+#[derive(Debug)]
+struct AmpUsage {
+    limits: Vec<CapacityLimit>,
+    warning: Option<String>,
+}
+
+fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
     let mut limits = Vec::new();
     let mut contract_lines = 0;
     let mut parsed_lines = 0;
@@ -1243,10 +1267,14 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
             parsed_lines += 1;
             continue;
         }
-        if let Some(rest) = line.strip_prefix("Subscription ") {
-            let Some((plan, rest)) = rest.split_once(": ") else {
-                continue;
-            };
+        let subscription_line = line
+            .strip_prefix("Subscription ")
+            .and_then(|rest| rest.split_once(": "))
+            .or_else(|| {
+                line.strip_prefix("**")
+                    .and_then(|rest| rest.split_once(" Subscription:** "))
+            });
+        if let Some((plan, rest)) = subscription_line {
             if !valid_amp_name(plan) {
                 continue;
             }
@@ -1304,6 +1332,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
         }
         if let Some((remaining, suffix)) = line
             .strip_prefix("Individual credits: $")
+            .or_else(|| line.strip_prefix("**Individual credits:** $"))
             .and_then(|value| value.split_once(" remaining"))
         {
             if valid_amp_advice_suffix(suffix) {
@@ -1333,12 +1362,13 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<Vec<CapacityLi
     if limits.is_empty() && signed_out {
         return Err(anyhow!("Amp CLI is signed out"));
     }
-    if limits.is_empty() || parsed_lines != contract_lines {
+    if limits.is_empty() {
         return Err(anyhow!(
             "Amp usage output did not match text contract v{AMP_USAGE_TEXT_VERSION}"
         ));
     }
-    Ok(limits)
+    let warning = (parsed_lines != contract_lines).then(|| AMP_PARTIAL_WARNING.to_string());
+    Ok(AmpUsage { limits, warning })
 }
 
 #[cfg(unix)]
@@ -1488,17 +1518,23 @@ fn command_stdout_with_timeout(
     Ok(stdout)
 }
 
-fn collect_amp(_spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
+fn collect_amp(_spec: &AccountSpec) -> Result<CollectedCapacity> {
     let stdout =
         command_stdout_with_timeout(Path::new("amp"), &["usage".into()], AMP_USAGE_TIMEOUT)
             .context("run official amp usage command")?;
     let output = String::from_utf8(stdout).context("amp usage output is not UTF-8")?;
-    parse_amp_usage_at(&output, Utc::now())
+    let usage = parse_amp_usage_at(&output, Utc::now())?;
+    Ok(CollectedCapacity {
+        limits: usage.limits,
+        credential_label: String::new(),
+        capacity_scope: String::new(),
+        warning: usage.warning.unwrap_or_default(),
+    })
 }
 
 fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
     match spec.provider.as_str() {
-        "amp" => collect_amp(spec).map(CollectedCapacity::limits),
+        "amp" => collect_amp(spec),
         "anthropic" => collect_anthropic(spec).map(CollectedCapacity::limits),
         "openai" => collect_openai(spec).map(CollectedCapacity::limits),
         "openrouter" => collect_openrouter(spec),
@@ -1602,6 +1638,7 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
                 limits: collected.limits,
                 fetched_at: Utc::now(),
                 error: String::new(),
+                warning: collected.warning,
                 collector_fingerprint: collector_fingerprint(spec),
             };
             if let Some(parent) = cache_path(spec).parent() {
@@ -1645,6 +1682,7 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
                     }],
                     fetched_at: Utc::now(),
                     error: detail,
+                    warning: String::new(),
                     collector_fingerprint: collector_fingerprint(spec),
                 }
             }
@@ -2236,6 +2274,12 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                     }
                 }
             }
+            if !compact && !account.warning.is_empty() {
+                lines.push(format!(
+                    "  \x1b[33m{}\x1b[0m",
+                    truncate_text(&account.warning, width.saturating_sub(2))
+                ));
+            }
             let error_is_already_shown = account
                 .limits
                 .iter()
@@ -2395,7 +2439,8 @@ mod tests {
             include_str!("../tests/fixtures/amp/free_dollars.txt"),
             Utc::now(),
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].name, "Amp Free");
         assert_eq!(limits[0].remaining, Some(4.71));
@@ -2412,7 +2457,8 @@ mod tests {
             include_str!("../tests/fixtures/amp/free_daily.txt"),
             Utc::now(),
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(limits[0].remaining_percent, Some(61.0));
         assert_eq!(limits[0].resets_at, None);
         assert_eq!(limits[0].detail, "resets daily");
@@ -2425,7 +2471,8 @@ mod tests {
             .with_timezone(&Utc);
         let limits =
             parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
-                .unwrap();
+                .unwrap()
+                .limits;
         assert_eq!(
             limits
                 .iter()
@@ -2457,7 +2504,8 @@ mod tests {
             "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 1 day",
             now,
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(limits.len(), 2);
         assert!(limits
             .iter()
@@ -2471,14 +2519,16 @@ mod tests {
             include_str!("../tests/fixtures/amp/credits.txt"),
             Utc::now(),
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(credits[0].remaining, Some(25.64));
 
         let workspaces = parse_amp_usage_at(
             include_str!("../tests/fixtures/amp/workspaces.txt"),
             Utc::now(),
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].name, "Workspace Example One");
         assert_eq!(workspaces[0].remaining, Some(1234.56));
@@ -2487,13 +2537,58 @@ mod tests {
 
     #[test]
     fn parses_combined_amp_contract_and_ignores_identity_and_advice() {
-        let limits = parse_amp_usage_at(
+        let usage = parse_amp_usage_at(
             include_str!("../tests/fixtures/amp/combined.txt"),
             Utc::now(),
         )
         .unwrap();
-        assert_eq!(limits.len(), 5);
-        assert!(limits.iter().all(|limit| !limit.name.contains('@')));
+        assert_eq!(usage.limits.len(), 5);
+        assert!(usage.limits.iter().all(|limit| !limit.name.contains('@')));
+        assert!(usage.warning.is_none());
+    }
+
+    #[test]
+    fn parses_current_amp_cli_bold_labels_and_details_advice() {
+        let now = DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/current_bold_labels.txt"),
+            now,
+        )
+        .unwrap();
+        assert!(usage.warning.is_none());
+        assert_eq!(
+            usage
+                .limits
+                .iter()
+                .map(|limit| (
+                    limit.name.as_str(),
+                    limit.remaining_percent,
+                    limit.remaining
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Amp Megawatt · other", Some(0.0), None),
+                ("Amp Megawatt · orb", Some(100.0), None),
+                ("Individual credits", None, Some(2.95)),
+            ]
+        );
+        assert!(usage
+            .limits
+            .iter()
+            .take(2)
+            .all(|limit| limit.resets_at == Some(now + Duration::days(18))));
+    }
+
+    #[test]
+    fn rejects_malformed_bold_amp_subscription_and_credits_labels() {
+        for output in [
+            "**Amp Megawatt Subscription** 0% other usage and 100% orb usage remaining - resets upon renewal in 18 days",
+            "**Individual credits** $2.95 remaining",
+        ] {
+            assert!(parse_amp_usage_at(output, Utc::now()).is_err());
+        }
     }
 
     #[test]
@@ -2501,13 +2596,11 @@ mod tests {
         for output in [
             "You are not signed in. Run amp login.",
             "Amp Free now has plenty remaining",
-            "Individual credits: $5.00 remaining\nWorkspace changed format",
             "Amp Free: $4.71/$oops remaining (replenishes +$0.42/hour)",
             "Amp Free: -1% remaining today (resets daily)",
             "Amp Free: 101% remaining today (resets daily)",
             "Individual credits: $NaN remaining",
             "Individual credits: $5.00 remaining unexpected text",
-            "Individual credits: $5.00 remaining\nTeam Demo: $50.00 remaining",
             "Workspace Demo\u{1b}[2J: $5.00 remaining",
             "Subscription Demo\u{7}: 97% other usage and 100% orb usage remaining - resets upon renewal in 29 days",
             "Subscription Megawatt: 97% other usage and 100% orb usage remaining - resets upon renewal in 999999999999999999 days",
@@ -2517,12 +2610,76 @@ mod tests {
     }
 
     #[test]
+    fn amp_signed_out_output_is_unavailable_not_partial() {
+        let error =
+            parse_amp_usage_at("You are not signed in. Run amp login.", Utc::now()).unwrap_err();
+        assert!(error.to_string().contains("signed out"));
+    }
+
+    #[test]
+    fn amp_usage_keeps_parsed_limits_visible_when_a_line_is_an_unrecognized_notice() {
+        let usage = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\nNote: usage percentages are approximate.",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(usage.limits.len(), 1);
+        assert_eq!(usage.limits[0].remaining, Some(5.00));
+        assert_eq!(usage.warning.as_deref(), Some(AMP_PARTIAL_WARNING));
+    }
+
+    #[test]
+    fn amp_usage_keeps_parsed_limits_visible_for_an_unrecognized_new_balance_type() {
+        let usage = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\nTeam Demo: $50.00 remaining",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(usage.limits.len(), 1);
+        assert_eq!(usage.limits[0].name, "Individual credits");
+        assert!(usage.warning.is_some());
+    }
+
+    #[test]
+    fn amp_usage_does_not_retain_a_misleading_value_for_a_malformed_known_line() {
+        let usage = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\nWorkspace changed format",
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(usage.limits.len(), 1);
+        assert!(!usage
+            .limits
+            .iter()
+            .any(|limit| limit.name.contains("Workspace")));
+        assert!(usage.warning.is_some());
+    }
+
+    #[test]
+    fn amp_partial_warning_is_rendered_and_serializes_without_raw_output() {
+        let mut account = test_account("billing", "AMP billing", 0.0);
+        account.provider = "amp".into();
+        account.limits = parse_amp_usage_at("Individual credits: $5.00 remaining", Utc::now())
+            .unwrap()
+            .limits;
+        account.warning = AMP_PARTIAL_WARNING.into();
+        let output = strip_ansi(&render(&Config::default(), &[account.clone()], false, 80));
+        assert!(output.contains("not understood"));
+
+        let probe = serde_json::to_value(&account).unwrap();
+        assert_eq!(probe["warning"], AMP_PARTIAL_WARNING);
+        assert!(!probe.to_string().contains("Workspace changed format"));
+        assert!(!probe.to_string().contains("Team Demo"));
+    }
+
+    #[test]
     fn signed_in_amp_usage_can_include_login_advice() {
         let limits = parse_amp_usage_at(
             "Individual credits: $25.64 remaining\nRun amp login to switch accounts",
             Utc::now(),
         )
-        .unwrap();
+        .unwrap()
+        .limits;
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].remaining, Some(25.64));
     }
@@ -3115,6 +3272,7 @@ mod tests {
             limits: collected.limits,
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         };
         let pane = strip_ansi(&render(
@@ -3164,7 +3322,8 @@ mod tests {
             .with_timezone(&Utc);
         let mut limits =
             parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
-                .unwrap();
+                .unwrap()
+                .limits;
         limits.push(money_limit("Individual credits", 25.64, None));
         let account = CapacityAccount {
             provider: "amp".into(),
@@ -3176,6 +3335,7 @@ mod tests {
             limits,
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         };
         for width in [30, 80] {
@@ -3340,6 +3500,7 @@ mod tests {
             ],
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         };
         for width in [20, 30, 36, 80] {
@@ -3503,6 +3664,7 @@ mod tests {
             limits: vec![quota_limit("5h", Some(used), None)],
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         }
     }

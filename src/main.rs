@@ -1219,6 +1219,12 @@ fn valid_amp_name(name: &str) -> bool {
 const AMP_PARTIAL_WARNING: &str =
     "Amp usage output included lines that were not understood; some balances may be missing.";
 
+/// The exact, conclusive Amp signed-out/authentication error message. Shared
+/// between `parse_amp_usage_at` (which raises it) and `collect_account`
+/// (which recognizes it to suppress stale-cache fallback for this provider),
+/// so the two stay in sync without brittle substring matching.
+const AMP_SIGNED_OUT_ERROR: &str = "Amp CLI is signed out";
+
 #[derive(Debug)]
 struct AmpUsage {
     limits: Vec<CapacityLimit>,
@@ -1376,7 +1382,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
         }
     }
     if signed_out {
-        return Err(anyhow!("Amp CLI is signed out"));
+        return Err(anyhow!(AMP_SIGNED_OUT_ERROR));
     }
     if limits.is_empty() {
         return Err(anyhow!(
@@ -1558,6 +1564,17 @@ fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
     }
 }
 
+/// True only for the exact, conclusive Amp signed-out/authentication error on
+/// an Amp account. Deliberately narrow (provider match plus an exact message
+/// match against the single error `parse_amp_usage_at` raises for this case)
+/// so transient Amp failures (timeout, command error, unrecognized text) and
+/// every other provider keep the normal stale-cache fallback in
+/// `collect_account`; only this conclusive case must never show stale limits,
+/// per issue #8.
+fn is_amp_signed_out_error(spec: &AccountSpec, error: &anyhow::Error) -> bool {
+    spec.provider == "amp" && error.to_string() == AMP_SIGNED_OUT_ERROR
+}
+
 fn cache_path(spec: &AccountSpec) -> PathBuf {
     let digest = Sha256::digest(format!("{}\0{}", spec.provider, spec.account_id).as_bytes());
     state_dir().join(format!("account-{}.json", hex_lower(&digest[..16])))
@@ -1667,41 +1684,57 @@ fn collect_account(spec: &AccountSpec, refresh_seconds: i64, force: bool) -> Cap
             }
             account
         }
-        Err(error) => {
-            if let Some(mut cached) =
-                cached.filter(|account| stale_cache_is_usable(account.fetched_at, Utc::now()))
-            {
-                cached.error = format!("{error:#}");
-                for limit in &mut cached.limits {
-                    limit.status = LimitStatus::Stale;
-                }
-                cached
-            } else {
-                let detail = format!("{error:#}");
-                CapacityAccount {
-                    provider: spec.provider.clone(),
-                    account_id: spec.account_id.clone(),
-                    label: spec.label.clone(),
-                    auth_type: spec.auth_type.clone(),
-                    credential_label: String::new(),
-                    capacity_scope: String::new(),
-                    limits: vec![CapacityLimit {
-                        name: "capacity".into(),
-                        kind: "quota".into(),
-                        unit: "percent".into(),
-                        remaining: None,
-                        total: None,
-                        remaining_percent: None,
-                        resets_at: None,
-                        status: LimitStatus::Unavailable,
-                        detail: detail.clone(),
-                    }],
-                    fetched_at: Utc::now(),
-                    error: detail,
-                    warning: String::new(),
-                    collector_fingerprint: collector_fingerprint(spec),
-                }
-            }
+        Err(error) => account_for_collection_error(spec, cached, error),
+    }
+}
+
+/// Turns a `collect_limits` failure into the account to report: either the
+/// previous cached value marked stale, or a fresh unavailable placeholder.
+///
+/// A conclusive Amp signed-out/authentication result must never fall back to
+/// a previously cached successful value: per issue #8, that case is
+/// unavailable, not stale. Every other error (transient Amp failures, and
+/// all other providers) keeps the normal stale-cache fallback.
+fn account_for_collection_error(
+    spec: &AccountSpec,
+    cached: Option<CapacityAccount>,
+    error: anyhow::Error,
+) -> CapacityAccount {
+    let usable_cache = if is_amp_signed_out_error(spec, &error) {
+        None
+    } else {
+        cached.filter(|account| stale_cache_is_usable(account.fetched_at, Utc::now()))
+    };
+    if let Some(mut cached) = usable_cache {
+        cached.error = format!("{error:#}");
+        for limit in &mut cached.limits {
+            limit.status = LimitStatus::Stale;
+        }
+        cached
+    } else {
+        let detail = format!("{error:#}");
+        CapacityAccount {
+            provider: spec.provider.clone(),
+            account_id: spec.account_id.clone(),
+            label: spec.label.clone(),
+            auth_type: spec.auth_type.clone(),
+            credential_label: String::new(),
+            capacity_scope: String::new(),
+            limits: vec![CapacityLimit {
+                name: "capacity".into(),
+                kind: "quota".into(),
+                unit: "percent".into(),
+                remaining: None,
+                total: None,
+                remaining_percent: None,
+                resets_at: None,
+                status: LimitStatus::Unavailable,
+                detail: detail.clone(),
+            }],
+            fetched_at: Utc::now(),
+            error: detail,
+            warning: String::new(),
+            collector_fingerprint: collector_fingerprint(spec),
         }
     }
 }
@@ -3505,6 +3538,62 @@ mod tests {
         assert_eq!(stale_age_label(now - Duration::seconds(30), now), "now");
         assert_eq!(stale_age_label(now - Duration::minutes(5), now), "5m");
         assert_eq!(stale_age_label(now - Duration::hours(3), now), "3h");
+    }
+
+    fn amp_spec(account_id: &str, label: &str) -> AccountSpec {
+        serde_json::from_value(json!({
+            "provider": "amp",
+            "accountId": account_id,
+            "label": label,
+            "authType": "cli"
+        }))
+        .unwrap()
+    }
+
+    fn cached_amp_account_with_credits(remaining: f64) -> CapacityAccount {
+        CapacityAccount {
+            provider: "amp".into(),
+            account_id: "billing".into(),
+            label: "AMP billing".into(),
+            auth_type: "cli".into(),
+            credential_label: String::new(),
+            capacity_scope: String::new(),
+            limits: vec![money_limit("Individual credits", remaining, None)],
+            fetched_at: Utc::now(),
+            error: String::new(),
+            warning: String::new(),
+            collector_fingerprint: String::new(),
+        }
+    }
+
+    #[test]
+    fn amp_signed_out_error_clears_cached_limits_and_becomes_unavailable() {
+        let spec = amp_spec("billing", "AMP billing");
+        let cached = cached_amp_account_with_credits(25.64);
+        let account =
+            account_for_collection_error(&spec, Some(cached), anyhow!(AMP_SIGNED_OUT_ERROR));
+        assert_eq!(account.limits.len(), 1);
+        assert_eq!(account.limits[0].status, LimitStatus::Unavailable);
+        assert!(account.limits[0].remaining.is_none());
+        assert!(!account
+            .limits
+            .iter()
+            .any(|limit| limit.status == LimitStatus::Stale));
+        assert!(account.error.contains("signed out"));
+    }
+
+    #[test]
+    fn transient_amp_error_still_reuses_stale_cached_limits() {
+        let spec = amp_spec("billing", "AMP billing");
+        let cached = cached_amp_account_with_credits(25.64);
+        let account = account_for_collection_error(
+            &spec,
+            Some(cached),
+            anyhow!("command timed out after 10s"),
+        );
+        assert_eq!(account.limits.len(), 1);
+        assert_eq!(account.limits[0].status, LimitStatus::Stale);
+        assert_eq!(account.limits[0].remaining, Some(25.64));
     }
 
     #[test]

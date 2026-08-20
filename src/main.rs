@@ -1179,16 +1179,15 @@ fn amp_metadata_line(line: &str) -> bool {
         || line.starts_with("http://")
 }
 
+/// Conclusive signed-out/authentication markers only. "run amp login" alone is
+/// deliberately excluded: Amp CLI also surfaces it as account-switching advice
+/// while already signed in (see `signed_in_amp_usage_can_include_login_advice`),
+/// so it cannot be treated as unconditional proof of a signed-out session.
 fn amp_signed_out_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    [
-        "not signed in",
-        "not logged in",
-        "run amp login",
-        "sign in to amp",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    ["not signed in", "not logged in", "sign in to amp"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn valid_amp_advice_suffix(suffix: &str) -> bool {
@@ -1359,7 +1358,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
             }
         }
     }
-    if limits.is_empty() && signed_out {
+    if signed_out {
         return Err(anyhow!("Amp CLI is signed out"));
     }
     if limits.is_empty() {
@@ -2613,6 +2612,16 @@ mod tests {
     fn amp_signed_out_output_is_unavailable_not_partial() {
         let error =
             parse_amp_usage_at("You are not signed in. Run amp login.", Utc::now()).unwrap_err();
+        assert!(error.to_string().contains("signed out"));
+    }
+
+    #[test]
+    fn amp_signed_out_marker_wins_even_with_a_parsed_looking_limit_line() {
+        let error = parse_amp_usage_at(
+            "Individual credits: $5.00 remaining\nYou are not signed in. Run amp login.",
+            Utc::now(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("signed out"));
     }
 

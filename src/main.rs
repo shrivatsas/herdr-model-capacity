@@ -1732,14 +1732,6 @@ fn provider_color(provider: &str) -> &'static str {
     }
 }
 
-fn capacity_scope_label(scope: &str) -> &str {
-    match scope {
-        "key_spending_limit" => "OpenRouter key spending limit",
-        "account_credits" => "account-wide OpenRouter credits",
-        _ => "",
-    }
-}
-
 fn render_bar(percent: f64, width: usize, warning: f64, critical: f64) -> String {
     let percent = clamp_percent(percent);
     let filled = (percent / 100.0 * width as f64).round() as usize;
@@ -2202,24 +2194,6 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
                 "\x1b[1m{}{stale}\x1b[0m",
                 truncate_text(&account.label, label_width)
             ));
-            if !compact {
-                let scope = capacity_scope_label(&account.capacity_scope);
-                if !scope.is_empty() {
-                    lines.push(format!(
-                        "  \x1b[2m{}\x1b[0m",
-                        truncate_text(scope, width.saturating_sub(2))
-                    ));
-                }
-                if !account.credential_label.is_empty() {
-                    lines.push(format!(
-                        "  \x1b[2m{}\x1b[0m",
-                        truncate_text(
-                            &format!("key ID {}", account.credential_label),
-                            width.saturating_sub(2)
-                        )
-                    ));
-                }
-            }
             if account.provider == "amp" {
                 lines.extend(render_amp_limits(&account.limits, config, compact, width));
             } else {
@@ -3094,7 +3068,7 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_identity_and_scope_are_rendered_and_serialized() {
+    fn openrouter_card_omits_identity_and_scope_but_preserves_capacity_data() {
         let collected = parse_openrouter_key(
             &json!({"data": {
                 "label": "sk-or-v1-…cafe",
@@ -3105,7 +3079,7 @@ mod tests {
             OpenRouterScope::Key,
         )
         .unwrap();
-        let account = CapacityAccount {
+        let key_account = CapacityAccount {
             provider: "openrouter".into(),
             account_id: "default".into(),
             label: "Personal OpenRouter".into(),
@@ -3117,24 +3091,39 @@ mod tests {
             error: String::new(),
             collector_fingerprint: String::new(),
         };
-        let pane = strip_ansi(&render(
-            &Config::default(),
-            std::slice::from_ref(&account),
-            false,
-            80,
-        ));
+        let credits = parse_openrouter_credits(
+            &json!({"data": {"total_credits": 50.0, "total_usage": 12.5}}),
+            "sk-or-mgmt-…1234".into(),
+        )
+        .unwrap();
+        let credits_account = CapacityAccount {
+            provider: "openrouter".into(),
+            account_id: "management".into(),
+            label: "Work OpenRouter".into(),
+            auth_type: "api".into(),
+            credential_label: credits.credential_label,
+            capacity_scope: credits.capacity_scope,
+            limits: credits.limits,
+            fetched_at: Utc::now(),
+            error: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        let accounts = [key_account, credits_account];
+        let pane = strip_ansi(&render(&Config::default(), &accounts, false, 80));
         assert!(pane.contains("Personal OpenRouter"));
-        assert!(pane.contains("OpenRouter key spending limit"));
-        assert!(pane.contains("key ID sk-or-v1-…cafe"));
-        let compact = strip_ansi(&render(
-            &Config::default(),
-            std::slice::from_ref(&account),
-            true,
-            30,
-        ));
-        assert!(!compact.contains("key ID"));
-        assert!(!compact.contains("OpenRouter key spending limit"));
-        let probe = serde_json::to_value(account).unwrap();
+        assert!(pane.contains("$8.00/$10.00 remaining"));
+        assert!(pane.contains("Work OpenRouter"));
+        assert!(pane.contains("$37.50/$50.00 remaining"));
+        assert!(!pane.contains("OpenRouter key spending limit"));
+        assert!(!pane.contains("account-wide OpenRouter credits"));
+        assert!(!pane.contains("key ID sk-or-v1-…cafe"));
+        assert!(!pane.contains("key ID sk-or-mgmt-…1234"));
+        let compact = strip_ansi(&render(&Config::default(), &accounts, true, 30));
+        assert!(compact.contains("Personal OpenRouter"));
+        assert!(compact.contains("$8.00/$10.00"));
+        assert!(compact.contains("Work OpenRouter"));
+        assert!(compact.contains("$37.50/$50.00"));
+        let probe = serde_json::to_value(&accounts[0]).unwrap();
         assert_eq!(probe["credentialLabel"], "sk-or-v1-…cafe");
         assert_eq!(probe["capacityScope"], "key_spending_limit");
     }

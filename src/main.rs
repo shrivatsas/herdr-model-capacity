@@ -248,8 +248,34 @@ fn load_config() -> Result<Config> {
     .with_context(|| format!("parse {}", path.display()))
 }
 
+fn claude_config_dir(spec: &AccountSpec) -> PathBuf {
+    if let Some(dir) = &spec.config_dir {
+        return expand_home(dir);
+    }
+    // Honor `CLAUDE_CONFIG_DIR` so the per-account `.claude-accounts/<name>`
+    // prefix workflow Claude Code uses keeps working without a per-account
+    // `configDir` override. Explicit `configDir` wins; the env var is the
+    // fallback before the historical `~/.claude` default.
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        return if dir.is_absolute() {
+            dir
+        } else {
+            expand_home(&dir)
+        };
+    }
+    home_dir().join(".claude")
+}
+
+/// Resolve a Claude OAuth credential the same way Claude Code does.
+///
+/// On macOS, when `CLAUDE_CONFIG_DIR` points somewhere other than the default
+/// `~/.claude`, Claude Code stores the OAuth payload in a *namespaced*
+/// Keychain item: `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`. The
+/// default config dir keeps the un-suffixed `Claude Code-credentials` service.
 fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> {
-    let file = expand_home(config_dir).join(".credentials.json");
+    let resolved = expand_home(config_dir);
+    let file = resolved.join(".credentials.json");
     if let Some(oauth) = read_json(file).and_then(|root| root.get("claudeAiOauth").cloned()) {
         if oauth.get("accessToken").and_then(Value::as_str).is_some() {
             return Some(oauth);
@@ -258,13 +284,15 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
     if !allow_keychain || !cfg!(target_os = "macos") {
         return None;
     }
+    let default_dir = home_dir().join(".claude");
+    let service = if resolved == default_dir {
+        "Claude Code-credentials".to_string()
+    } else {
+        let fingerprint = claude_config_dir_fingerprint(&resolved);
+        format!("Claude Code-credentials-{fingerprint}")
+    };
     let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", &service, "-w"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -274,6 +302,50 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
         .ok()?
         .get("claudeAiOauth")
         .cloned()
+}
+
+/// Match Claude Code's Keychain service suffix: the first 8 hex chars of the
+/// SHA-256 of the absolute config dir. The path is made absolute against the
+/// working directory but symlinks are intentionally NOT resolved, mirroring
+/// Node's `path.resolve` (which Claude Code uses to derive the namespace).
+fn claude_config_dir_fingerprint(dir: &Path) -> String {
+    let absolute = make_absolute(dir);
+    let normalized = normalize_path(&absolute);
+    let display = normalized.display().to_string();
+    hex_lower(&Sha256::digest(display.as_bytes())).get(..8).unwrap_or("").to_string()
+}
+
+fn make_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    }
+}
+
+/// Collapse `.` and `..` components without touching symlinks, so two paths
+/// that Claude Code would hash identically produce the same fingerprint.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = Vec::new();
+    for component in path.components() {
+        use std::path::Component as C;
+        match component {
+            C::CurDir => {}
+            C::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str().to_owned()),
+        }
+    }
+    let mut result = PathBuf::new();
+    for part in out {
+        result.push(part);
+    }
+    if result.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        result
+    }
 }
 
 fn resolve_secret_ref(reference: &SecretRef) -> Result<String> {
@@ -555,10 +627,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     if let Some(reference) = &spec.secret_ref {
         return collect_anthropic_secret_ref_with(reference, resolve_secret_ref, get_json);
     }
-    let dir = spec
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| home_dir().join(".claude"));
+    let dir = claude_config_dir(spec);
     let oauth = claude_credentials(&dir, spec.allow_keychain)
         .ok_or_else(|| anyhow!("no Claude OAuth credential in {}", dir.display()))?;
     claude_oauth_usage_with(&oauth, get_json)
@@ -1591,16 +1660,27 @@ fn collector_fingerprint(spec: &AccountSpec) -> String {
             })
             .unwrap_or_default()
     };
+    // For Claude Code accounts the credential location depends on the resolved
+    // config dir (which may come from `CLAUDE_CONFIG_DIR`), not just
+    // `spec.config_dir`. Fold that resolved dir into the fingerprint so the
+    // cache entry invalidates when the account follows a different
+    // `.claude-accounts/<name>` prefix.
+    let config_dir_display = if spec.provider == "anthropic" && spec.secret_ref.is_none() {
+        claude_config_dir(spec).display().to_string()
+    } else {
+        spec.config_dir
+            .as_ref()
+            .map(expand_home)
+            .unwrap_or_default()
+            .display()
+            .to_string()
+    };
     let material = format!(
         "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         spec.provider,
         spec.auth_type,
         spec.source,
-        spec.config_dir
-            .as_ref()
-            .map(expand_home)
-            .unwrap_or_default()
-            .display(),
+        config_dir_display,
         spec.allow_keychain,
         spec.codex_home
             .as_ref()
@@ -3355,6 +3435,7 @@ mod tests {
             limits: credits.limits,
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         };
         let accounts = [key_account, credits_account];
@@ -3609,6 +3690,45 @@ mod tests {
         .unwrap();
         assert!(spec.config_dir.is_none());
         assert!(!spec.allow_keychain);
+    }
+
+    #[test]
+    fn claude_config_dir_fingerprint_matches_claude_code_namespacing() {
+        // The service suffix Claude Code writes when CLAUDE_CONFIG_DIR points at
+        // a non-default dir is the first 8 hex chars of sha256(abs_config_dir).
+        // A stale Keychain item observed in the wild for
+        // /Users/shrivatsa/.claude-accounts/shrivatsa-dev had service
+        // "Claude Code-credentials-c7eb4308"; reproducing that hash here pins
+        // the contract so the prefix workflow keeps resolving the right item.
+        let dir = Path::new("/Users/shrivatsa/.claude-accounts/shrivatsa-dev");
+        assert_eq!(claude_config_dir_fingerprint(dir), "c7eb4308");
+    }
+
+    #[test]
+    fn claude_config_dir_prefers_explicit_then_env_then_default() {
+        // Explicit configDir wins over the env var.
+        let explicit: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "a",
+            "label": "A",
+            "configDir": "/explicit/claude"
+        }))
+        .unwrap();
+        env::set_var("CLAUDE_CONFIG_DIR", "/env/claude");
+        assert_eq!(claude_config_dir(&explicit), PathBuf::from("/explicit/claude"));
+
+        // No explicit configDir: fall back to CLAUDE_CONFIG_DIR, ~-expanded.
+        let none: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "a",
+            "label": "A"
+        }))
+        .unwrap();
+        assert_eq!(claude_config_dir(&none), expand_home("/env/claude"));
+
+        // No configDir, no env: default ~/.claude.
+        env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(claude_config_dir(&none), home_dir().join(".claude"));
     }
 
     #[test]

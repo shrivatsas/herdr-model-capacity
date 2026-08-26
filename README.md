@@ -203,10 +203,19 @@ used to help author it, but never defines dashboard accounts.
       "label": "shrivatsa-dev",
       "authType": "oauth",
       "source": "claude-code",
+      "configDir": "~/.claude-accounts/shrivatsa-dev",
+      "allowKeychain": true
+    },
+    {
+      "provider": "anthropic",
+      "accountId": "shrivatsa-swadi",
+      "label": "shrivatsa-swadi",
+      "authType": "oauth",
+      "source": "claude-code",
       "secretRef": {
         "kind": "macos-keychain",
         "service": "herdr-model-capacity-claude",
-        "account": "shrivatsa-dev"
+        "account": "shrivatsa-swadi"
       }
     },
     {
@@ -273,13 +282,25 @@ account is displayed as unknown rather than using historical organization cost.
 
 ### Claude/Anthropic
 
-Claude Code's normal macOS login uses one shared `Claude Code-credentials`
-Keychain item. `CLAUDE_CONFIG_DIR` alone therefore does not isolate multiple
-subscription logins. `allowKeychain` enables that standard item for an
-account — this is the only account that should read the standard item.
+The plugin resolves each Claude account's config dir the same way Claude Code
+does: an explicit `configDir` wins, then `CLAUDE_CONFIG_DIR` (`~`-expanded),
+then the default `~/.claude`. This means the `.claude-accounts/<name>` prefix
+workflow — running Claude with `CLAUDE_CONFIG_DIR=~/.claude-accounts/<name>`
+— is followed automatically once `allowKeychain` is on; no per-account
+`configDir` is required. Setting `configDir` explicitly is still recommended
+when the pane process might not inherit `CLAUDE_CONFIG_DIR`.
 
-A second macOS subscription needs a **named** Keychain item selected by a
-`macos-keychain` `secretRef`. The plugin asks `security` for the configured
+On macOS, Claude Code namespaces its Keychain item by config dir. The default
+`~/.claude` dir uses the un-suffixed `Claude Code-credentials` service; any
+other dir uses `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`, so each
+`.claude-accounts/<name>` prefix gets its own isolated OAuth item. The plugin
+derives that suffix identically and reads the matching item — `CLAUDE_CONFIG_DIR`
+*does* isolate subscription logins on macOS. `allowKeychain` must still be
+opt-in per account.
+
+A second macOS subscription that is *not* reachable via a distinct config dir
+needs a **named** Keychain item selected by a `macos-keychain` `secretRef`.
+The plugin asks `security` for the configured
 service and account and never writes, logs, or renders the returned value.
 What that item holds decides how it is collected:
 
@@ -294,9 +315,15 @@ What that item holds decides how it is collected:
 
   ```bash
   # After signing the second subscription into Claude Code so it is the
-  # one currently in "Claude Code-credentials":
+  # one currently in the standard "Claude Code-credentials" item:
   security add-generic-password -U -s herdr-model-capacity-claude -a shrivatsa-dev \
     -w "$(security find-generic-password -s "Claude Code-credentials" -w)"
+  #
+  # If the second subscription uses its own CLAUDE_CONFIG_DIR prefix, read
+  # the namespaced item instead:
+  #   service="Claude Code-credentials-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
+  #   security add-generic-password -U -s herdr-model-capacity-claude -a shrivatsa-dev \
+  #     -w "$(security find-generic-password -s "$service" -w)"
   ```
 
   Re-run this whenever that subscription's token is refreshed by signing

@@ -191,31 +191,31 @@ used to help author it, but never defines dashboard accounts.
     },
     {
       "provider": "anthropic",
-      "accountId": "housemed",
-      "label": "Housemed",
+      "accountId": "work",
+      "label": "Work",
       "authType": "oauth",
       "source": "claude-code",
       "allowKeychain": true
     },
     {
       "provider": "anthropic",
-      "accountId": "shrivatsa-dev",
-      "label": "shrivatsa-dev",
+      "accountId": "personal",
+      "label": "Personal",
       "authType": "oauth",
       "source": "claude-code",
-      "configDir": "~/.claude-accounts/shrivatsa-dev",
+      "configDir": "~/.claude-accounts/personal",
       "allowKeychain": true
     },
     {
       "provider": "anthropic",
-      "accountId": "shrivatsa-swadi",
-      "label": "shrivatsa-swadi",
+      "accountId": "personal",
+      "label": "Personal",
       "authType": "oauth",
       "source": "claude-code",
       "secretRef": {
         "kind": "macos-keychain",
         "service": "herdr-model-capacity-claude",
-        "account": "shrivatsa-swadi"
+        "account": "personal"
       }
     },
     {
@@ -316,13 +316,13 @@ What that item holds decides how it is collected:
   ```bash
   # After signing the second subscription into Claude Code so it is the
   # one currently in the standard "Claude Code-credentials" item:
-  security add-generic-password -U -s herdr-model-capacity-claude -a shrivatsa-dev \
+  security add-generic-password -U -s herdr-model-capacity-claude -a personal \
     -w "$(security find-generic-password -s "Claude Code-credentials" -w)"
   #
   # If the second subscription uses its own CLAUDE_CONFIG_DIR prefix, read
   # the namespaced item instead:
   #   service="Claude Code-credentials-$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)"
-  #   security add-generic-password -U -s herdr-model-capacity-claude -a shrivatsa-dev \
+  #   security add-generic-password -U -s herdr-model-capacity-claude -a personal \
   #     -w "$(security find-generic-password -s "$service" -w)"
   ```
 

@@ -3211,31 +3211,31 @@ mod tests {
 
     #[test]
     fn standard_and_named_claude_credentials_collect_independently_with_distinct_reasons() {
-        // Housemed: the standard `Claude Code-credentials` Keychain item, modeled
-        // as the OAuth payload `claude_credentials` would hand to the collector.
-        let housemed_oauth = json!({
-            "accessToken": "housemed-token",
+        // The standard `Claude Code-credentials` Keychain item, modeled as the
+        // OAuth payload `claude_credentials` would hand to the collector.
+        let standard_oauth = json!({
+            "accessToken": "standard-token",
             "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
         });
-        let housemed_limits = claude_oauth_usage_with(&housemed_oauth, |_url, _headers| {
+        let standard_limits = claude_oauth_usage_with(&standard_oauth, |_url, _headers| {
             Ok(json!({"five_hour": {"utilization": 30.0}, "seven_day": {"utilization": 10.0}}))
         })
         .unwrap();
-        assert_eq!(housemed_limits[0].remaining_percent, Some(70.0));
+        assert_eq!(standard_limits[0].remaining_percent, Some(70.0));
 
-        // shrivatsa-dev: a named Keychain item under
-        // herdr-model-capacity-claude/shrivatsa-dev holding an OAuth-shaped
-        // credential, collected independently from Housemed.
+        // A named Keychain item under
+        // herdr-model-capacity-claude/personal holding an OAuth-shaped
+        // credential, collected independently from the standard item.
         let named = SecretRef {
             kind: "macos-keychain".into(),
             service: "herdr-model-capacity-claude".into(),
-            account: "shrivatsa-dev".into(),
+            account: "personal".into(),
         };
-        let shrivatsa_dev_limits = collect_anthropic_secret_ref_with(
+        let named_limits = collect_anthropic_secret_ref_with(
             &named,
             |_| {
                 Ok(json!({"claudeAiOauth": {
-                    "accessToken": "shrivatsa-dev-token",
+                    "accessToken": "named-token",
                     "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
                 }})
                 .to_string())
@@ -3245,7 +3245,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(shrivatsa_dev_limits[0].remaining_percent, Some(95.0));
+        assert_eq!(named_limits[0].remaining_percent, Some(95.0));
 
         // A genuine setup-token-shaped secret is reported as unsupported, never
         // as zero, and never re-attempts the network.
@@ -3268,40 +3268,40 @@ mod tests {
 
     #[test]
     fn distinct_anthropic_accounts_get_unique_cache_keys_and_independent_fingerprints() {
-        let housemed: AccountSpec = serde_json::from_value(json!({
+        let standard: AccountSpec = serde_json::from_value(json!({
             "provider": "anthropic",
-            "accountId": "housemed",
-            "label": "Housemed",
+            "accountId": "work",
+            "label": "Work",
             "authType": "oauth",
             "allowKeychain": true
         }))
         .unwrap();
-        let mut shrivatsa_dev: AccountSpec = serde_json::from_value(json!({
+        let mut personal: AccountSpec = serde_json::from_value(json!({
             "provider": "anthropic",
-            "accountId": "shrivatsa-dev",
-            "label": "shrivatsa-dev",
+            "accountId": "personal",
+            "label": "Personal",
             "authType": "oauth",
             "secretRef": {
                 "kind": "macos-keychain",
                 "service": "herdr-model-capacity-claude",
-                "account": "shrivatsa-dev"
+                "account": "personal"
             }
         }))
         .unwrap();
 
-        assert_ne!(cache_path(&housemed), cache_path(&shrivatsa_dev));
-        let housemed_fingerprint = collector_fingerprint(&housemed);
-        let original_shrivatsa_dev_fingerprint = collector_fingerprint(&shrivatsa_dev);
-        assert_ne!(housemed_fingerprint, original_shrivatsa_dev_fingerprint);
+        assert_ne!(cache_path(&standard), cache_path(&personal));
+        let standard_fingerprint = collector_fingerprint(&standard);
+        let original_personal_fingerprint = collector_fingerprint(&personal);
+        assert_ne!(standard_fingerprint, original_personal_fingerprint);
 
-        // Changing shrivatsa-dev's credential reference invalidates only its own
-        // cache entry; Housemed refreshes independently.
-        shrivatsa_dev.secret_ref.as_mut().unwrap().account = "personal".into();
+        // Changing the personal account's credential reference invalidates only
+        // its own cache entry; the standard account refreshes independently.
+        personal.secret_ref.as_mut().unwrap().account = "alt".into();
         assert_ne!(
-            collector_fingerprint(&shrivatsa_dev),
-            original_shrivatsa_dev_fingerprint
+            collector_fingerprint(&personal),
+            original_personal_fingerprint
         );
-        assert_eq!(collector_fingerprint(&housemed), housemed_fingerprint);
+        assert_eq!(collector_fingerprint(&standard), standard_fingerprint);
     }
 
     #[test]
@@ -3310,12 +3310,12 @@ mod tests {
             "accounts": [
                 {
                     "provider": "anthropic",
-                    "accountId": "shrivatsa-dev",
-                    "label": "shrivatsa-dev",
+                    "accountId": "work",
+                    "label": "Work",
                     "secretRef": {
                         "kind": "macos-keychain",
                         "service": "herdr-model-capacity-claude",
-                        "account": "shrivatsa-dev"
+                        "account": "shared"
                     }
                 },
                 {
@@ -3325,7 +3325,7 @@ mod tests {
                     "secretRef": {
                         "kind": "macos-keychain",
                         "service": "herdr-model-capacity-claude",
-                        "account": "shrivatsa-dev"
+                        "account": "shared"
                     }
                 }
             ]
@@ -3333,7 +3333,7 @@ mod tests {
         .unwrap();
         let (specs, errors) = configured_accounts(&config);
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].account_id, "shrivatsa-dev");
+        assert_eq!(specs[0].account_id, "work");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].error.contains("duplicate Keychain reference"));
     }
@@ -3694,14 +3694,22 @@ mod tests {
 
     #[test]
     fn claude_config_dir_fingerprint_matches_claude_code_namespacing() {
-        // The service suffix Claude Code writes when CLAUDE_CONFIG_DIR points at
-        // a non-default dir is the first 8 hex chars of sha256(abs_config_dir).
-        // A stale Keychain item observed in the wild for
-        // /Users/shrivatsa/.claude-accounts/shrivatsa-dev had service
-        // "Claude Code-credentials-c7eb4308"; reproducing that hash here pins
-        // the contract so the prefix workflow keeps resolving the right item.
-        let dir = Path::new("/Users/shrivatsa/.claude-accounts/shrivatsa-dev");
-        assert_eq!(claude_config_dir_fingerprint(dir), "c7eb4308");
+        // Claude Code namespaces its Keychain item by config dir: the service
+        // for a non-default dir is
+        // `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`. Pin the
+        // contract (first 8 hex chars of SHA-256 of the absolute dir) with a
+        // synthetic path so a future change in Claude Code's namespacing can't
+        // silently break resolution here.
+        let dir = Path::new("/home/user/.claude-accounts/work");
+        let expected: String = hex_lower(&Sha256::digest(
+            dir.to_string_lossy().as_bytes(),
+        ))
+        .get(..8)
+        .unwrap()
+        .into();
+        assert_eq!(claude_config_dir_fingerprint(dir), expected);
+        // Sanity-check the helper against a known digest prefix.
+        assert_eq!(&hex_lower(&Sha256::digest(b"abc"))[..8], "ba7816bf");
     }
 
     #[test]

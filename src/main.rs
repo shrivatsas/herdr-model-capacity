@@ -248,8 +248,34 @@ fn load_config() -> Result<Config> {
     .with_context(|| format!("parse {}", path.display()))
 }
 
+fn claude_config_dir(spec: &AccountSpec) -> PathBuf {
+    if let Some(dir) = &spec.config_dir {
+        return expand_home(dir);
+    }
+    // Honor `CLAUDE_CONFIG_DIR` so the per-account `.claude-accounts/<name>`
+    // prefix workflow Claude Code uses keeps working without a per-account
+    // `configDir` override. Explicit `configDir` wins; the env var is the
+    // fallback before the historical `~/.claude` default.
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        return if dir.is_absolute() {
+            dir
+        } else {
+            expand_home(&dir)
+        };
+    }
+    home_dir().join(".claude")
+}
+
+/// Resolve a Claude OAuth credential the same way Claude Code does.
+///
+/// On macOS, when `CLAUDE_CONFIG_DIR` points somewhere other than the default
+/// `~/.claude`, Claude Code stores the OAuth payload in a *namespaced*
+/// Keychain item: `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`. The
+/// default config dir keeps the un-suffixed `Claude Code-credentials` service.
 fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> {
-    let file = expand_home(config_dir).join(".credentials.json");
+    let resolved = expand_home(config_dir);
+    let file = resolved.join(".credentials.json");
     if let Some(oauth) = read_json(file).and_then(|root| root.get("claudeAiOauth").cloned()) {
         if oauth.get("accessToken").and_then(Value::as_str).is_some() {
             return Some(oauth);
@@ -258,13 +284,15 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
     if !allow_keychain || !cfg!(target_os = "macos") {
         return None;
     }
+    let default_dir = home_dir().join(".claude");
+    let service = if resolved == default_dir {
+        "Claude Code-credentials".to_string()
+    } else {
+        let fingerprint = claude_config_dir_fingerprint(&resolved);
+        format!("Claude Code-credentials-{fingerprint}")
+    };
     let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", &service, "-w"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -274,6 +302,50 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
         .ok()?
         .get("claudeAiOauth")
         .cloned()
+}
+
+/// Match Claude Code's Keychain service suffix: the first 8 hex chars of the
+/// SHA-256 of the absolute config dir. The path is made absolute against the
+/// working directory but symlinks are intentionally NOT resolved, mirroring
+/// Node's `path.resolve` (which Claude Code uses to derive the namespace).
+fn claude_config_dir_fingerprint(dir: &Path) -> String {
+    let absolute = make_absolute(dir);
+    let normalized = normalize_path(&absolute);
+    let display = normalized.display().to_string();
+    hex_lower(&Sha256::digest(display.as_bytes())).get(..8).unwrap_or("").to_string()
+}
+
+fn make_absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    }
+}
+
+/// Collapse `.` and `..` components without touching symlinks, so two paths
+/// that Claude Code would hash identically produce the same fingerprint.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = Vec::new();
+    for component in path.components() {
+        use std::path::Component as C;
+        match component {
+            C::CurDir => {}
+            C::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str().to_owned()),
+        }
+    }
+    let mut result = PathBuf::new();
+    for part in out {
+        result.push(part);
+    }
+    if result.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        result
+    }
 }
 
 fn resolve_secret_ref(reference: &SecretRef) -> Result<String> {
@@ -555,10 +627,7 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
     if let Some(reference) = &spec.secret_ref {
         return collect_anthropic_secret_ref_with(reference, resolve_secret_ref, get_json);
     }
-    let dir = spec
-        .config_dir
-        .clone()
-        .unwrap_or_else(|| home_dir().join(".claude"));
+    let dir = claude_config_dir(spec);
     let oauth = claude_credentials(&dir, spec.allow_keychain)
         .ok_or_else(|| anyhow!("no Claude OAuth credential in {}", dir.display()))?;
     claude_oauth_usage_with(&oauth, get_json)
@@ -1591,16 +1660,27 @@ fn collector_fingerprint(spec: &AccountSpec) -> String {
             })
             .unwrap_or_default()
     };
+    // For Claude Code accounts the credential location depends on the resolved
+    // config dir (which may come from `CLAUDE_CONFIG_DIR`), not just
+    // `spec.config_dir`. Fold that resolved dir into the fingerprint so the
+    // cache entry invalidates when the account follows a different
+    // `.claude-accounts/<name>` prefix.
+    let config_dir_display = if spec.provider == "anthropic" && spec.secret_ref.is_none() {
+        claude_config_dir(spec).display().to_string()
+    } else {
+        spec.config_dir
+            .as_ref()
+            .map(expand_home)
+            .unwrap_or_default()
+            .display()
+            .to_string()
+    };
     let material = format!(
         "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         spec.provider,
         spec.auth_type,
         spec.source,
-        spec.config_dir
-            .as_ref()
-            .map(expand_home)
-            .unwrap_or_default()
-            .display(),
+        config_dir_display,
         spec.allow_keychain,
         spec.codex_home
             .as_ref()
@@ -3131,31 +3211,31 @@ mod tests {
 
     #[test]
     fn standard_and_named_claude_credentials_collect_independently_with_distinct_reasons() {
-        // Housemed: the standard `Claude Code-credentials` Keychain item, modeled
-        // as the OAuth payload `claude_credentials` would hand to the collector.
-        let housemed_oauth = json!({
-            "accessToken": "housemed-token",
+        // The standard `Claude Code-credentials` Keychain item, modeled as the
+        // OAuth payload `claude_credentials` would hand to the collector.
+        let standard_oauth = json!({
+            "accessToken": "standard-token",
             "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
         });
-        let housemed_limits = claude_oauth_usage_with(&housemed_oauth, |_url, _headers| {
+        let standard_limits = claude_oauth_usage_with(&standard_oauth, |_url, _headers| {
             Ok(json!({"five_hour": {"utilization": 30.0}, "seven_day": {"utilization": 10.0}}))
         })
         .unwrap();
-        assert_eq!(housemed_limits[0].remaining_percent, Some(70.0));
+        assert_eq!(standard_limits[0].remaining_percent, Some(70.0));
 
-        // shrivatsa-dev: a named Keychain item under
-        // herdr-model-capacity-claude/shrivatsa-dev holding an OAuth-shaped
-        // credential, collected independently from Housemed.
+        // A named Keychain item under
+        // herdr-model-capacity-claude/personal holding an OAuth-shaped
+        // credential, collected independently from the standard item.
         let named = SecretRef {
             kind: "macos-keychain".into(),
             service: "herdr-model-capacity-claude".into(),
-            account: "shrivatsa-dev".into(),
+            account: "personal".into(),
         };
-        let shrivatsa_dev_limits = collect_anthropic_secret_ref_with(
+        let named_limits = collect_anthropic_secret_ref_with(
             &named,
             |_| {
                 Ok(json!({"claudeAiOauth": {
-                    "accessToken": "shrivatsa-dev-token",
+                    "accessToken": "named-token",
                     "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
                 }})
                 .to_string())
@@ -3165,7 +3245,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(shrivatsa_dev_limits[0].remaining_percent, Some(95.0));
+        assert_eq!(named_limits[0].remaining_percent, Some(95.0));
 
         // A genuine setup-token-shaped secret is reported as unsupported, never
         // as zero, and never re-attempts the network.
@@ -3188,40 +3268,40 @@ mod tests {
 
     #[test]
     fn distinct_anthropic_accounts_get_unique_cache_keys_and_independent_fingerprints() {
-        let housemed: AccountSpec = serde_json::from_value(json!({
+        let standard: AccountSpec = serde_json::from_value(json!({
             "provider": "anthropic",
-            "accountId": "housemed",
-            "label": "Housemed",
+            "accountId": "work",
+            "label": "Work",
             "authType": "oauth",
             "allowKeychain": true
         }))
         .unwrap();
-        let mut shrivatsa_dev: AccountSpec = serde_json::from_value(json!({
+        let mut personal: AccountSpec = serde_json::from_value(json!({
             "provider": "anthropic",
-            "accountId": "shrivatsa-dev",
-            "label": "shrivatsa-dev",
+            "accountId": "personal",
+            "label": "Personal",
             "authType": "oauth",
             "secretRef": {
                 "kind": "macos-keychain",
                 "service": "herdr-model-capacity-claude",
-                "account": "shrivatsa-dev"
+                "account": "personal"
             }
         }))
         .unwrap();
 
-        assert_ne!(cache_path(&housemed), cache_path(&shrivatsa_dev));
-        let housemed_fingerprint = collector_fingerprint(&housemed);
-        let original_shrivatsa_dev_fingerprint = collector_fingerprint(&shrivatsa_dev);
-        assert_ne!(housemed_fingerprint, original_shrivatsa_dev_fingerprint);
+        assert_ne!(cache_path(&standard), cache_path(&personal));
+        let standard_fingerprint = collector_fingerprint(&standard);
+        let original_personal_fingerprint = collector_fingerprint(&personal);
+        assert_ne!(standard_fingerprint, original_personal_fingerprint);
 
-        // Changing shrivatsa-dev's credential reference invalidates only its own
-        // cache entry; Housemed refreshes independently.
-        shrivatsa_dev.secret_ref.as_mut().unwrap().account = "personal".into();
+        // Changing the personal account's credential reference invalidates only
+        // its own cache entry; the standard account refreshes independently.
+        personal.secret_ref.as_mut().unwrap().account = "alt".into();
         assert_ne!(
-            collector_fingerprint(&shrivatsa_dev),
-            original_shrivatsa_dev_fingerprint
+            collector_fingerprint(&personal),
+            original_personal_fingerprint
         );
-        assert_eq!(collector_fingerprint(&housemed), housemed_fingerprint);
+        assert_eq!(collector_fingerprint(&standard), standard_fingerprint);
     }
 
     #[test]
@@ -3230,12 +3310,12 @@ mod tests {
             "accounts": [
                 {
                     "provider": "anthropic",
-                    "accountId": "shrivatsa-dev",
-                    "label": "shrivatsa-dev",
+                    "accountId": "work",
+                    "label": "Work",
                     "secretRef": {
                         "kind": "macos-keychain",
                         "service": "herdr-model-capacity-claude",
-                        "account": "shrivatsa-dev"
+                        "account": "shared"
                     }
                 },
                 {
@@ -3245,7 +3325,7 @@ mod tests {
                     "secretRef": {
                         "kind": "macos-keychain",
                         "service": "herdr-model-capacity-claude",
-                        "account": "shrivatsa-dev"
+                        "account": "shared"
                     }
                 }
             ]
@@ -3253,7 +3333,7 @@ mod tests {
         .unwrap();
         let (specs, errors) = configured_accounts(&config);
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].account_id, "shrivatsa-dev");
+        assert_eq!(specs[0].account_id, "work");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].error.contains("duplicate Keychain reference"));
     }
@@ -3355,6 +3435,7 @@ mod tests {
             limits: credits.limits,
             fetched_at: Utc::now(),
             error: String::new(),
+            warning: String::new(),
             collector_fingerprint: String::new(),
         };
         let accounts = [key_account, credits_account];
@@ -3609,6 +3690,53 @@ mod tests {
         .unwrap();
         assert!(spec.config_dir.is_none());
         assert!(!spec.allow_keychain);
+    }
+
+    #[test]
+    fn claude_config_dir_fingerprint_matches_claude_code_namespacing() {
+        // Claude Code namespaces its Keychain item by config dir: the service
+        // for a non-default dir is
+        // `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`. Pin the
+        // contract (first 8 hex chars of SHA-256 of the absolute dir) with a
+        // synthetic path so a future change in Claude Code's namespacing can't
+        // silently break resolution here.
+        let dir = Path::new("/home/user/.claude-accounts/work");
+        let expected: String = hex_lower(&Sha256::digest(
+            dir.to_string_lossy().as_bytes(),
+        ))
+        .get(..8)
+        .unwrap()
+        .into();
+        assert_eq!(claude_config_dir_fingerprint(dir), expected);
+        // Sanity-check the helper against a known digest prefix.
+        assert_eq!(&hex_lower(&Sha256::digest(b"abc"))[..8], "ba7816bf");
+    }
+
+    #[test]
+    fn claude_config_dir_prefers_explicit_then_env_then_default() {
+        // Explicit configDir wins over the env var.
+        let explicit: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "a",
+            "label": "A",
+            "configDir": "/explicit/claude"
+        }))
+        .unwrap();
+        env::set_var("CLAUDE_CONFIG_DIR", "/env/claude");
+        assert_eq!(claude_config_dir(&explicit), PathBuf::from("/explicit/claude"));
+
+        // No explicit configDir: fall back to CLAUDE_CONFIG_DIR, ~-expanded.
+        let none: AccountSpec = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "accountId": "a",
+            "label": "A"
+        }))
+        .unwrap();
+        assert_eq!(claude_config_dir(&none), expand_home("/env/claude"));
+
+        // No configDir, no env: default ~/.claude.
+        env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(claude_config_dir(&none), home_dir().join(".claude"));
     }
 
     #[test]

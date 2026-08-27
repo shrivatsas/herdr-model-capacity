@@ -326,9 +326,10 @@ What that item holds decides how it is collected:
   #     -w "$(security find-generic-password -s "$service" -w)"
   ```
 
-  Re-run this whenever that subscription's token is refreshed by signing
-  back into it in Claude Code; the plugin never refreshes or writes back to
-  Keychain itself.
+  Re-run this if you ever re-sign that subscription into Claude Code
+  from scratch and want the copy reset; the plugin otherwise keeps the
+  copy fresh itself (see the Claude access-token refresh note below), so
+  you do not need to re-run this command on every token rotation.
 
 - If it holds an official `claude setup-token` credential (or any other
   non-OAuth-shaped secret), that token can still pass Claude authentication
@@ -343,14 +344,25 @@ subscription — do not add a second account entry pointing at a Keychain item
 that already duplicates a registered subscription (for example, a stray
 `personal` item left over from an earlier setup).
 
-The OAuth usage endpoint is not a documented public API, and expired tokens
-are reported as expired rather than retried as generic failures. Successful
-values are cached; failures retain stale values for at most 24 hours and label
-their age. Each account refreshes independently — editing one account's
-`configDir`, `allowKeychain`, or `secretRef` only invalidates that account's
-cache. `allowKeychain` is always an explicit opt-in, including when
-`configDir` is omitted. Ordinary Anthropic API keys do not expose a
-credit-balance endpoint.
+The OAuth usage endpoint is not a documented public API. The plugin reads
+the OAuth payload Claude Code stores (`~/.<configDir>/.credentials.json` or
+the namespaced `Claude Code-credentials[-<fingerprint>]` Keychain item) and,
+**when the access token has expired**, refreshes it itself using the
+`refresh_token` grant against Claude Code's own token endpoint
+(`https://platform.claude.com/v1/oauth/token`, with Claude Code's static CLI
+client id), then persists the refreshed — and any rotated — token back to the
+same store. This is why the pane keeps reporting live usage between Claude
+Code sessions instead of going stale with `last refresh failed: Claude OAuth
+access token expired`. The refresh token itself may rotate on use; persisting
+it back is what keeps both Claude Code and the next herdr refresh working. If
+no usable refresh token is present (e.g. it too has expired), the plugin
+falls back to the familiar `access token expired` error, meaning you must run
+Claude Code to re-authenticate. Successful values are cached; failures retain
+stale values for at most 24 hours and label their age. Each account refreshes
+independently — editing one account's `configDir`, `allowKeychain`, or
+`secretRef` only invalidates that account's cache. `allowKeychain` is always
+an explicit opt-in, including when `configDir` is omitted. Ordinary
+Anthropic API keys do not expose a credit-balance endpoint.
 
 This named-Keychain path is macOS-only, requires the `security` CLI, and
 only recognizes the two payload shapes above; a malformed JSON blob or an

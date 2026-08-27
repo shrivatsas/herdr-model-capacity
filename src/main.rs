@@ -3,7 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,6 +31,16 @@ const DEFAULT_REFRESH_SECONDS: i64 = 180;
 const MAX_CONCURRENT_COLLECTORS: usize = 4;
 const AMP_USAGE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const AMP_USAGE_TEXT_VERSION: u8 = 1;
+
+// Claude Code's OAuth token endpoint and registered CLI client id. herdr uses
+// these to refresh the short-lived access token with the refresh token Claude
+// Code stored alongside it, so collection no longer fails every time the
+// access token expires between Claude Code sessions.
+//
+// The client id is the public, static value Claude Code itself sends; it is
+// not a secret.
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -273,12 +283,18 @@ fn claude_config_dir(spec: &AccountSpec) -> PathBuf {
 /// `~/.claude`, Claude Code stores the OAuth payload in a *namespaced*
 /// Keychain item: `Claude Code-credentials-<sha256(abs_config_dir)[:8]>`. The
 /// default config dir keeps the un-suffixed `Claude Code-credentials` service.
-fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> {
+///
+/// Returns the OAuth payload *and* the store it came from, so a refreshed
+/// access token can be persisted back to the same place Claude Code keeps it.
+fn claude_credentials(
+    config_dir: &Path,
+    allow_keychain: bool,
+) -> Option<(Value, ClaudeCredentialStore)> {
     let resolved = expand_home(config_dir);
     let file = resolved.join(".credentials.json");
-    if let Some(oauth) = read_json(file).and_then(|root| root.get("claudeAiOauth").cloned()) {
+    if let Some(oauth) = read_json(&file).and_then(|root| root.get("claudeAiOauth").cloned()) {
         if oauth.get("accessToken").and_then(Value::as_str).is_some() {
-            return Some(oauth);
+            return Some((oauth, ClaudeCredentialStore::File(file)));
         }
     }
     if !allow_keychain || !cfg!(target_os = "macos") {
@@ -298,10 +314,17 @@ fn claude_credentials(config_dir: &Path, allow_keychain: bool) -> Option<Value> 
     if !output.status.success() {
         return None;
     }
-    serde_json::from_slice::<Value>(&output.stdout)
+    let oauth = serde_json::from_slice::<Value>(&output.stdout)
         .ok()?
         .get("claudeAiOauth")
-        .cloned()
+        .cloned()?;
+    Some((
+        oauth,
+        ClaudeCredentialStore::Keychain {
+            service,
+            account: None,
+        },
+    ))
 }
 
 /// Match Claude Code's Keychain service suffix: the first 8 hex chars of the
@@ -562,6 +585,31 @@ fn get_json(url: &str, headers: HeaderMap) -> Result<Value> {
     response.json().context("parse provider response")
 }
 
+fn post_json(url: &str, body: Value, mut headers: HeaderMap) -> Result<Value> {
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&format!("herdr-model-capacity/{VERSION}"))?,
+    );
+    let response = client()?
+        .post(url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), detail));
+    }
+    response.json().context("parse provider response")
+}
+
 fn clamp_percent(value: f64) -> f64 {
     value.clamp(0.0, 100.0)
 }
@@ -628,9 +676,9 @@ fn collect_anthropic(spec: &AccountSpec) -> Result<Vec<CapacityLimit>> {
         return collect_anthropic_secret_ref_with(reference, resolve_secret_ref, get_json);
     }
     let dir = claude_config_dir(spec);
-    let oauth = claude_credentials(&dir, spec.allow_keychain)
+    let (oauth, store) = claude_credentials(&dir, spec.allow_keychain)
         .ok_or_else(|| anyhow!("no Claude OAuth credential in {}", dir.display()))?;
-    claude_oauth_usage_with(&oauth, get_json)
+    claude_usage_with_refresh(&oauth, &store, get_json, refresh_claude_oauth)
 }
 
 /// A named Keychain credential may hold either a copy of a Claude Code OAuth
@@ -645,7 +693,10 @@ fn collect_anthropic_secret_ref_with(
 ) -> Result<Vec<CapacityLimit>> {
     let secret = secret_lookup(reference)?;
     match parse_claude_oauth_secret(&secret) {
-        Some(oauth) => claude_oauth_usage_with(&oauth, request),
+        Some(oauth) => {
+            let store = ClaudeCredentialStore::from_secret_ref(reference);
+            claude_usage_with_refresh(&oauth, &store, request, refresh_claude_oauth)
+        }
         None => Ok(vec![unsupported_claude_credential_limit()]),
     }
 }
@@ -705,6 +756,237 @@ fn claude_oauth_usage_with(
 /// before an error can be persisted to the cache or rendered in the pane.
 fn redact_claude_error(error: anyhow::Error, token: &str) -> anyhow::Error {
     anyhow!(format!("{error:#}").replace(token, "[redacted]"))
+}
+
+/// Where a Claude OAuth payload was sourced, so a refreshed access token can
+/// be persisted back to the same place Claude Code keeps it. herdr refreshes
+/// the short-lived access token itself using the refresh token Claude Code
+/// stored alongside it, instead of failing collection every time the access
+/// token expires between Claude Code sessions.
+enum ClaudeCredentialStore {
+    /// Cannot persist (credential supplied inline for a probe, or persistence
+    /// disabled). A refreshed token is still used for the current collection.
+    #[allow(dead_code)]
+    None,
+    /// `~/.<configDir>/.credentials.json` (the file Claude Code also reads).
+    File(PathBuf),
+    #[cfg(target_os = "macos")]
+    Keychain {
+        service: String,
+        /// Known account (e.g. a configured `secretRef`); otherwise resolved
+        /// at save time from the existing item or the current user.
+        account: Option<String>,
+    },
+}
+
+impl ClaudeCredentialStore {
+    #[cfg(target_os = "macos")]
+    fn from_secret_ref(reference: &SecretRef) -> Self {
+        Self::Keychain {
+            service: reference.service.clone(),
+            account: Some(reference.account.clone()),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn from_secret_ref(_reference: &SecretRef) -> Self {
+        Self::None
+    }
+
+    /// Persist a refreshed OAuth payload back to its origin. Best-effort from
+    /// the caller's perspective: errors here must not void a successful
+    /// refresh used for the current collection, but they are returned so the
+    /// caller can surface them when refresh itself was the goal.
+    fn save(&self, oauth: &Value) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::File(path) => {
+                let mut root: Value = read_json(path).unwrap_or_else(|| json!({}));
+                if !root.is_object() {
+                    root = json!({});
+                }
+                root["claudeAiOauth"] = oauth.clone();
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let temporary = path.with_extension("json.tmp");
+                fs::write(&temporary, serde_json::to_vec(&root).unwrap_or_default())
+                    .with_context(|| format!("write {}", temporary.display()))?;
+                fs::rename(&temporary, path)
+                    .with_context(|| format!("rename {}", path.display()))?;
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Self::Keychain { service, account } => {
+                let account = account
+                    .clone()
+                    .or_else(|| keychain_account_for_service(service))
+                    .or_else(|| env::var("USER").ok())
+                    .unwrap_or_else(|| "claude-code-user".into());
+                // Claude Code stores the item as hex-encoded UTF-8 JSON via
+                // `security add-generic-password -U -a <acct> -s <svc> -X <hex>`;
+                // mirror that exactly so the item stays readable by Claude Code.
+                let wrapped = json!({ "claudeAiOauth": oauth });
+                let bytes = serde_json::to_vec(&wrapped)
+                    .context("serialize refreshed Claude OAuth payload")?;
+                let hex = hex_lower(&bytes);
+                let output = Command::new("security")
+                    .args([
+                        "add-generic-password",
+                        "-U",
+                        "-a",
+                        &account,
+                        "-s",
+                        service,
+                        "-X",
+                        &hex,
+                    ])
+                    .output()
+                    .context("update macOS Keychain Claude OAuth item")?;
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "macOS Keychain update for {service} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Discover the account name of an existing macOS Keychain generic item by
+/// service, so an item Claude Code created (account = current user) can be
+/// updated in place rather than duplicated under a guessed account.
+#[cfg(target_os = "macos")]
+fn keychain_account_for_service(service: &str) -> Option<String> {
+    let output = Command::new("security")
+        .args(["find-generic-password", "-s", service])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line.strip_prefix("\"acct\"")?;
+        let eq = rest.find('=')?;
+        let val = rest[eq + 1..].trim().trim_matches('"');
+        (!val.is_empty()).then(|| val.to_string())
+    })
+}
+
+/// Refresh a Claude OAuth access token using the refresh token Claude Code
+/// stored, mirroring Claude Code's own `grant_type=refresh_token` call to
+/// the platform token endpoint. The response fields are mapped back into the
+/// same shape the keychain/file stores (`accessToken`, `refreshToken`,
+/// `expiresAt`, `refreshTokenExpiresAt`, `scopes`), merging with the prior
+/// payload so `subscriptionType`/`rateLimitTier` survive.
+///
+/// `post` is injectable so the request/parse contract is unit-testable
+/// without hitting the network.
+fn refresh_claude_oauth_with(
+    oauth: &Value,
+    post: impl FnOnce(&str, Value, HeaderMap) -> Result<Value>,
+) -> Result<Value> {
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no refresh token to refresh Claude OAuth access token"))?;
+    if let Some(expires) = parse_time(oauth.get("refreshTokenExpiresAt")) {
+        if expires <= Utc::now() {
+            return Err(anyhow!(
+                "Claude OAuth refresh token expired; run Claude Code to re-authenticate"
+            ));
+        }
+    }
+    let scope = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let mut body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    });
+    if let Some(scope) = scope {
+        body["scope"] = json!(scope);
+    }
+    let response = post(CLAUDE_OAUTH_TOKEN_URL, body, HeaderMap::new())
+        .map_err(|error| redact_claude_error(error, refresh_token))?;
+    let access_token = response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Claude OAuth refresh response missing access_token"))?;
+    let now_ms = Utc::now().timestamp_millis();
+    let expires_in = response
+        .get("expires_in")
+        .and_then(Value::as_f64)
+        .unwrap_or(3600.0);
+    let mut merged = oauth.clone();
+    merged["accessToken"] = json!(access_token);
+    if let Some(new_rt) = response.get("refresh_token").and_then(Value::as_str) {
+        merged["refreshToken"] = json!(new_rt);
+    }
+    merged["expiresAt"] = json!(now_ms + (expires_in * 1000.0) as i64);
+    if let Some(rtei) = response
+        .get("refresh_token_expires_in")
+        .and_then(Value::as_f64)
+    {
+        merged["refreshTokenExpiresAt"] = json!(now_ms + (rtei * 1000.0) as i64);
+    }
+    if let Some(scope) = response.get("scope").and_then(Value::as_str) {
+        let scopes: Vec<Value> = scope
+            .split_whitespace()
+            .map(|s| json!(s))
+            .collect();
+        merged["scopes"] = Value::Array(scopes);
+    }
+    Ok(merged)
+}
+
+fn refresh_claude_oauth(oauth: &Value) -> Result<Value> {
+    refresh_claude_oauth_with(oauth, post_json)
+}
+
+/// Collect Claude usage, refreshing the access token first if it has expired
+/// and a usable refresh token is available. A successful refresh is
+/// persisted back to the originating store (best-effort) so Claude Code and
+/// the next herdr refresh see the rotated refresh token. When no refresh is
+/// possible, falls through to `claude_oauth_usage_with`, which surfaces the
+/// familiar "access token expired" error.
+fn claude_usage_with_refresh(
+    oauth: &Value,
+    store: &ClaudeCredentialStore,
+    request: impl FnMut(&str, HeaderMap) -> Result<Value>,
+    refresh: impl FnOnce(&Value) -> Result<Value>,
+) -> Result<Vec<CapacityLimit>> {
+    let now = Utc::now();
+    let access_expired = parse_time(oauth.get("expiresAt")).is_some_and(|expires| expires <= now);
+    let refreshable = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .is_some()
+        && parse_time(oauth.get("refreshTokenExpiresAt"))
+            .map(|expires| expires > now)
+            .unwrap_or(true);
+    let oauth = if access_expired && refreshable {
+        let refreshed = refresh(oauth)?;
+        if let Err(error) = store.save(&refreshed) {
+            // A persist failure must not void a successful refresh used for
+            // this collection; log via stderr so it is visible without failing.
+            eprintln!("herdr: failed to persist refreshed Claude OAuth: {error:#}");
+        }
+        refreshed
+    } else {
+        oauth.clone()
+    };
+    claude_oauth_usage_with(&oauth, request)
 }
 
 fn parse_claude_usage(data: &Value) -> Vec<CapacityLimit> {
@@ -3207,6 +3489,130 @@ mod tests {
         assert!(rejected.contains("403"));
         assert!(rejected.contains("[redacted]"));
         assert!(!rejected.contains("token"));
+    }
+
+    #[test]
+    fn claude_usage_refreshes_expired_access_token_then_retries() {
+        // Access token expired, but a usable refresh token is still present:
+        // herdr must refresh, persist to the store, then call usage with the
+        // new access token instead of surfacing an "expired" error.
+        use std::sync::{Arc, Mutex};
+        let saved: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+        let saved_for_persist = saved.clone();
+
+        let expired_oauth = json!({
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": (Utc::now() - Duration::hours(1)).to_rfc3339(),
+            "refreshTokenExpiresAt": (Utc::now() + Duration::days(30)).to_rfc3339(),
+            "scopes": ["user:inference", "user:profile"],
+        });
+        let refreshed = json!({
+            "accessToken": "new-access",
+            "refreshToken": "new-refresh",
+            "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339(),
+            "refreshTokenExpiresAt": (Utc::now() + Duration::days(30)).to_rfc3339(),
+            "scopes": ["user:inference", "user:profile"],
+        });
+
+        // Persist via a File store to a temp path so the write is observable
+        // without touching the real macOS Keychain.
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-claude-refresh-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(".credentials.json");
+        let store = ClaudeCredentialStore::File(path.clone());
+
+        let limits = claude_usage_with_refresh(
+            &expired_oauth,
+            &store,
+            |url, headers| {
+                assert_eq!(url, "https://api.anthropic.com/api/oauth/usage");
+                assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer new-access");
+                Ok(json!({"five_hour": {"utilization": 20.0}, "seven_day": {"utilization": 40.0}}))
+            },
+            |_| Ok(refreshed.clone()),
+        )
+        .unwrap();
+        assert_eq!(limits[0].remaining_percent, Some(80.0));
+
+        // The refreshed payload was persisted back as {"claudeAiOauth": {...}}.
+        let persisted: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted["claudeAiOauth"]["accessToken"], "new-access");
+        let _ = saved_for_persist; // silence unused if assertion path changes
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_usage_keeps_expired_error_without_refresh_token() {
+        // No refresh token available: herdr cannot refresh, so it falls
+        // through to the familiar "access token expired" error without ever
+        // calling refresh or usage.
+        let expired = json!({
+            "accessToken": "token",
+            "expiresAt": (Utc::now() - Duration::hours(1)).to_rfc3339(),
+        });
+        let store = ClaudeCredentialStore::None;
+        let error = claude_usage_with_refresh(
+            &expired,
+            &store,
+            |_url, _headers| unreachable!("usage must not be called"),
+            |_| unreachable!("refresh must not be called"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expired"));
+    }
+
+    #[test]
+    fn refresh_claude_oauth_maps_response_and_rotates_refresh_token() {
+        // The refresh grant request shape and the response mapping are pinned:
+        // client_id/scope are sent, refresh_token is rotated when returned,
+        // expiresAt becomes a millisecond epoch, and subscriptionType survives.
+        let oauth = json!({
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": (Utc::now() - Duration::hours(1)).to_rfc3339(),
+            "refreshTokenExpiresAt": (Utc::now() + Duration::days(30)).to_rfc3339(),
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "pro",
+            "rateLimitTier": "default_claude_ai",
+        });
+        let after = Utc::now();
+
+        let merged = refresh_claude_oauth_with(&oauth, |_url, body, _headers| {
+            assert_eq!(body["grant_type"], "refresh_token");
+            assert_eq!(body["refresh_token"], "old-refresh");
+            assert_eq!(body["client_id"], CLAUDE_OAUTH_CLIENT_ID);
+            assert_eq!(body["scope"], "user:inference user:profile");
+            Ok(json!({
+                "access_token": "new-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 28800,
+                "refresh_token_expires_in": 2505600,
+                "scope": "user:inference user:profile",
+                "token_type": "Bearer",
+            }))
+        })
+        .unwrap();
+
+        assert_eq!(merged["accessToken"], "new-access");
+        assert_eq!(merged["refreshToken"], "rotated-refresh");
+        assert_eq!(merged["subscriptionType"], "pro");
+        assert_eq!(merged["rateLimitTier"], "default_claude_ai");
+        // expiresAt is a millisecond epoch ~8h in the future.
+        let exp = parse_time(merged.get("expiresAt")).unwrap();
+        assert!(exp > after);
+        assert!(exp <= after + Duration::seconds(28805));
+        let rte = parse_time(merged.get("refreshTokenExpiresAt")).unwrap();
+        assert!(rte > after);
+        assert_eq!(
+            merged["scopes"].as_array().unwrap().len(),
+            2
+        );
     }
 
     #[test]

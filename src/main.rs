@@ -292,13 +292,18 @@ fn claude_credentials(
 ) -> Option<(Value, ClaudeCredentialStore)> {
     let resolved = expand_home(config_dir);
     let file = resolved.join(".credentials.json");
-    if let Some(oauth) = read_json(&file).and_then(|root| root.get("claudeAiOauth").cloned()) {
-        if oauth.get("accessToken").and_then(Value::as_str).is_some() {
-            return Some((oauth, ClaudeCredentialStore::File(file)));
-        }
+    let file_oauth = read_json(&file).and_then(|root| root.get("claudeAiOauth").cloned());
+    if let Some(oauth) = file_oauth
+        .as_ref()
+        .filter(|oauth| claude_oauth_access_token_is_current(oauth))
+        .cloned()
+    {
+        return Some((oauth, ClaudeCredentialStore::File(file)));
     }
     if !allow_keychain || !cfg!(target_os = "macos") {
-        return None;
+        return file_oauth
+            .filter(|oauth| oauth.get("accessToken").and_then(Value::as_str).is_some())
+            .map(|oauth| (oauth, ClaudeCredentialStore::File(file)));
     }
     let default_dir = home_dir().join(".claude");
     let service = if resolved == default_dir {
@@ -314,17 +319,65 @@ fn claude_credentials(
     if !output.status.success() {
         return None;
     }
-    let oauth = serde_json::from_slice::<Value>(&output.stdout)
+    let keychain_oauth = serde_json::from_slice::<Value>(&output.stdout)
         .ok()?
         .get("claudeAiOauth")
-        .cloned()?;
-    Some((
-        oauth,
-        ClaudeCredentialStore::Keychain {
-            service,
-            account: None,
-        },
-    ))
+        .cloned();
+    if let Some((oauth, from_keychain)) =
+        preferred_current_claude_oauth(file_oauth.clone(), keychain_oauth.clone())
+    {
+        return Some(if from_keychain {
+            (
+                oauth,
+                ClaudeCredentialStore::Keychain {
+                    service,
+                    account: None,
+                },
+            )
+        } else {
+            (oauth, ClaudeCredentialStore::File(file))
+        });
+    }
+
+    // Neither access token is current. Prefer the file so its stored refresh
+    // token can be used by the refresh path, then fall back to Keychain.
+    file_oauth
+        .filter(|oauth| oauth.get("accessToken").and_then(Value::as_str).is_some())
+        .map(|oauth| (oauth, ClaudeCredentialStore::File(file)))
+        .or_else(|| {
+            keychain_oauth
+                .filter(|oauth| oauth.get("accessToken").and_then(Value::as_str).is_some())
+                .map(|oauth| {
+                    (
+                        oauth,
+                        ClaudeCredentialStore::Keychain {
+                            service,
+                            account: None,
+                        },
+                    )
+                })
+        })
+}
+
+/// A current Keychain token wins over an expired config-directory token. The
+/// boolean is true when the selected value came from Keychain.
+fn preferred_current_claude_oauth(
+    file_oauth: Option<Value>,
+    keychain_oauth: Option<Value>,
+) -> Option<(Value, bool)> {
+    file_oauth
+        .filter(claude_oauth_access_token_is_current)
+        .map(|oauth| (oauth, false))
+        .or_else(|| {
+            keychain_oauth
+                .filter(claude_oauth_access_token_is_current)
+                .map(|oauth| (oauth, true))
+        })
+}
+
+fn claude_oauth_access_token_is_current(oauth: &Value) -> bool {
+    oauth.get("accessToken").and_then(Value::as_str).is_some()
+        && !parse_time(oauth.get("expiresAt")).is_some_and(|expires| expires <= Utc::now())
 }
 
 /// Match Claude Code's Keychain service suffix: the first 8 hex chars of the
@@ -335,14 +388,19 @@ fn claude_config_dir_fingerprint(dir: &Path) -> String {
     let absolute = make_absolute(dir);
     let normalized = normalize_path(&absolute);
     let display = normalized.display().to_string();
-    hex_lower(&Sha256::digest(display.as_bytes())).get(..8).unwrap_or("").to_string()
+    hex_lower(&Sha256::digest(display.as_bytes()))
+        .get(..8)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn make_absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
@@ -770,7 +828,7 @@ enum ClaudeCredentialStore {
     None,
     /// `~/.<configDir>/.credentials.json` (the file Claude Code also reads).
     File(PathBuf),
-    #[cfg(target_os = "macos")]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Keychain {
         service: String,
         /// Known account (e.g. a configured `secretRef`); otherwise resolved
@@ -851,6 +909,8 @@ impl ClaudeCredentialStore {
                 }
                 Ok(())
             }
+            #[cfg(not(target_os = "macos"))]
+            Self::Keychain { .. } => Ok(()),
         }
     }
 }
@@ -867,13 +927,15 @@ fn keychain_account_for_service(service: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
-        let line = line.trim();
-        let rest = line.strip_prefix("\"acct\"")?;
-        let eq = rest.find('=')?;
-        let val = rest[eq + 1..].trim().trim_matches('"');
-        (!val.is_empty()).then(|| val.to_string())
-    })
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("\"acct\"")?;
+            let eq = rest.find('=')?;
+            let val = rest[eq + 1..].trim().trim_matches('"');
+            (!val.is_empty()).then(|| val.to_string())
+        })
 }
 
 /// Refresh a Claude OAuth access token using the refresh token Claude Code
@@ -900,15 +962,12 @@ fn refresh_claude_oauth_with(
             ));
         }
     }
-    let scope = oauth
-        .get("scopes")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
+    let scope = oauth.get("scopes").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
     let mut body = json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -941,10 +1000,7 @@ fn refresh_claude_oauth_with(
         merged["refreshTokenExpiresAt"] = json!(now_ms + (rtei * 1000.0) as i64);
     }
     if let Some(scope) = response.get("scope").and_then(Value::as_str) {
-        let scopes: Vec<Value> = scope
-            .split_whitespace()
-            .map(|s| json!(s))
-            .collect();
+        let scopes: Vec<Value> = scope.split_whitespace().map(|s| json!(s)).collect();
         merged["scopes"] = Value::Array(scopes);
     }
     Ok(merged)
@@ -968,10 +1024,7 @@ fn claude_usage_with_refresh(
 ) -> Result<Vec<CapacityLimit>> {
     let now = Utc::now();
     let access_expired = parse_time(oauth.get("expiresAt")).is_some_and(|expires| expires <= now);
-    let refreshable = oauth
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .is_some()
+    let refreshable = oauth.get("refreshToken").and_then(Value::as_str).is_some()
         && parse_time(oauth.get("refreshTokenExpiresAt"))
             .map(|expires| expires > now)
             .unwrap_or(true);
@@ -3466,6 +3519,24 @@ mod tests {
     }
 
     #[test]
+    fn expired_claude_config_token_yields_to_current_keychain_token() {
+        let expired_file = json!({
+            "accessToken": "expired-file-token",
+            "expiresAt": (Utc::now() - Duration::minutes(1)).to_rfc3339()
+        });
+        let fresh_keychain = json!({
+            "accessToken": "fresh-keychain-token",
+            "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()
+        });
+
+        let (selected, from_keychain) =
+            preferred_current_claude_oauth(Some(expired_file), Some(fresh_keychain))
+                .expect("the current Keychain token should be selected");
+        assert!(from_keychain);
+        assert_eq!(selected["accessToken"], "fresh-keychain-token");
+    }
+
+    #[test]
     fn claude_oauth_usage_distinguishes_success_expired_and_endpoint_rejection() {
         let oauth = json!({"accessToken": "token", "expiresAt": (Utc::now() + Duration::hours(1)).to_rfc3339()});
         let success = claude_oauth_usage_with(&oauth, |_url, headers| {
@@ -3517,10 +3588,8 @@ mod tests {
 
         // Persist via a File store to a temp path so the write is observable
         // without touching the real macOS Keychain.
-        let dir = std::env::temp_dir().join(format!(
-            "herdr-claude-refresh-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("herdr-claude-refresh-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(".credentials.json");
         let store = ClaudeCredentialStore::File(path.clone());
@@ -3609,10 +3678,7 @@ mod tests {
         assert!(exp <= after + Duration::seconds(28805));
         let rte = parse_time(merged.get("refreshTokenExpiresAt")).unwrap();
         assert!(rte > after);
-        assert_eq!(
-            merged["scopes"].as_array().unwrap().len(),
-            2
-        );
+        assert_eq!(merged["scopes"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -4107,12 +4173,10 @@ mod tests {
         // synthetic path so a future change in Claude Code's namespacing can't
         // silently break resolution here.
         let dir = Path::new("/home/user/.claude-accounts/work");
-        let expected: String = hex_lower(&Sha256::digest(
-            dir.to_string_lossy().as_bytes(),
-        ))
-        .get(..8)
-        .unwrap()
-        .into();
+        let expected: String = hex_lower(&Sha256::digest(dir.to_string_lossy().as_bytes()))
+            .get(..8)
+            .unwrap()
+            .into();
         assert_eq!(claude_config_dir_fingerprint(dir), expected);
         // Sanity-check the helper against a known digest prefix.
         assert_eq!(&hex_lower(&Sha256::digest(b"abc"))[..8], "ba7816bf");
@@ -4129,7 +4193,10 @@ mod tests {
         }))
         .unwrap();
         env::set_var("CLAUDE_CONFIG_DIR", "/env/claude");
-        assert_eq!(claude_config_dir(&explicit), PathBuf::from("/explicit/claude"));
+        assert_eq!(
+            claude_config_dir(&explicit),
+            PathBuf::from("/explicit/claude")
+        );
 
         // No explicit configDir: fall back to CLAUDE_CONFIG_DIR, ~-expanded.
         let none: AccountSpec = serde_json::from_value(json!({

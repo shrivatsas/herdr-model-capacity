@@ -1582,6 +1582,49 @@ struct AmpUsage {
     warning: Option<String>,
 }
 
+/// Parses the two usage-lane percentages and the days-until-renewal
+/// countdown from the text following "**<plan> Subscription:** " (or
+/// "Subscription <plan>: "). Handles both the older plain `X% other usage
+/// and Y% orb usage remaining - resets upon renewal in N days` line and the
+/// current `agent usage $A of $B remaining (X%), orb usage Ch of Dh <name>
+/// orb hours remaining (Y%) - period ..., ends in N days` line. The
+/// absolute dollar/hour amounts in the current form are intentionally
+/// discarded: this line has only ever surfaced a percent-of-entitlement
+/// value, so dropping the new absolute figures keeps the existing
+/// percent-only `CapacityLimit` representation rather than half-adopting
+/// units the rest of this branch doesn't model.
+fn parse_amp_subscription_percentages(rest: &str) -> Option<(f64, f64, i64)> {
+    let (other, orb, days) = if let Some((other, rest)) = rest.split_once("% other usage and ") {
+        let (orb, days) = rest.split_once("% orb usage remaining - resets upon renewal in ")?;
+        (other, orb, days)
+    } else {
+        let rest = rest.strip_prefix("agent usage $")?;
+        let (_, rest) = rest.split_once(" of $")?;
+        let (_, rest) = rest.split_once(" remaining (")?;
+        let (other, rest) = rest.split_once("%), orb usage ")?;
+        let (_, rest) = rest.split_once("h of ")?;
+        let (_, rest) = rest.split_once("h ")?;
+        let (_, rest) = rest.split_once(" orb hours remaining (")?;
+        let (orb, rest) = rest.split_once("%) - period ")?;
+        let (_, days) = rest.split_once(", ends in ")?;
+        (other, orb, days)
+    };
+    let days = days
+        .strip_suffix(" days")
+        .or_else(|| days.strip_suffix(" day"))?;
+    let (Some(other), Some(orb), Some(days)) = (
+        parse_amp_percent(other),
+        parse_amp_percent(orb),
+        days.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| days.parse::<i64>().ok())
+            .flatten(),
+    ) else {
+        return None;
+    };
+    Some((other, orb, days))
+}
+
 fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
     let mut limits = Vec::new();
     let mut contract_lines = 0;
@@ -1651,27 +1694,7 @@ fn parse_amp_usage_at(output: &str, now: DateTime<Utc>) -> Result<AmpUsage> {
             if !valid_amp_name(plan) {
                 continue;
             }
-            let Some((other, rest)) = rest.split_once("% other usage and ") else {
-                continue;
-            };
-            let Some((orb, days)) =
-                rest.split_once("% orb usage remaining - resets upon renewal in ")
-            else {
-                continue;
-            };
-            let days = days
-                .strip_suffix(" days")
-                .or_else(|| days.strip_suffix(" day"));
-            let (Some(other), Some(orb), Some(days)) = (
-                parse_amp_percent(other),
-                parse_amp_percent(orb),
-                days.and_then(|days| {
-                    days.bytes()
-                        .all(|c| c.is_ascii_digit())
-                        .then(|| days.parse::<i64>().ok())
-                        .flatten()
-                }),
-            ) else {
+            let Some((other, orb, days)) = parse_amp_subscription_percentages(rest) else {
                 continue;
             };
             let Some(reset) =
@@ -2878,6 +2901,36 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn parses_amp_subscription_agent_and_orb_hours_contract() {
+        let now = DateTime::parse_from_rfc3339("2026-09-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let usage = parse_amp_usage_at(
+            include_str!("../tests/fixtures/amp/current_agent_orb_hours.txt"),
+            now,
+        )
+        .unwrap();
+        assert!(usage.warning.is_none());
+        assert_eq!(
+            usage
+                .limits
+                .iter()
+                .map(|limit| (limit.name.as_str(), limit.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Amp Megawatt · other", Some(100.0)),
+                ("Amp Megawatt · orb", Some(100.0)),
+                ("Individual credits", None),
+            ]
+        );
+        assert!(usage
+            .limits
+            .iter()
+            .filter(|limit| limit.name.starts_with("Amp Megawatt"))
+            .all(|limit| limit.resets_at == Some(now + Duration::days(27))));
     }
 
     #[test]

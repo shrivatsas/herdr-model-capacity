@@ -442,8 +442,15 @@ daily-percent capacity, separate subscription “other” and “orb” lanes,
 individual credits, and multiple workspace balances. Both the plain
 (`Subscription <plan>: …`, `Individual credits: …`) and current Markdown-bold
 (`**<plan> Subscription:** …`, `**Individual credits:** …`) label forms are
-accepted. Dollar balances render as dollars. A subscription renewal timestamp
-is only approximated when the CLI reports a number of days; “resets daily” is
+accepted. Dollar balances render as dollars. The subscription line's body is
+accepted in both its older plain-percentage form (`X% other usage and Y% orb
+usage remaining - resets upon renewal in N days`) and its current form
+reporting absolute agent-dollar and orb-hour amounts alongside percentages and
+a billing period (`agent usage $A of $B remaining (X%), orb usage Ch of Dh
+<name> orb hours remaining (Y%) - period …, ends in N days`); only the two
+percentages and the days-until-renewal are kept, the absolute amounts and
+period dates are discarded. A subscription renewal timestamp is only
+approximated when the CLI reports a number of days; “resets daily” is
 retained as detail without inventing an exact timestamp. Identity lines,
 trailing CLI advice (including the `# Run amp usage --details` hint), and the
 raw output are ignored, and the registry's `accountId` and `label` remain

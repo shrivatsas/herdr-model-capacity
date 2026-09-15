@@ -13,4 +13,8 @@ command -v cargo >/dev/null 2>&1 || {
   exit 127
 }
 cargo build --release --manifest-path "$ROOT/Cargo.toml"
-cp "$ROOT/target/release/model-capacity" "$ROOT/bin/model-capacity"
+# Rename into place: copying over the binary fails with "Text file busy" while
+# an open capacity pane is still running it, and a rename keeps the pane on
+# its old inode until it is reopened.
+cp "$ROOT/target/release/model-capacity" "$ROOT/bin/model-capacity.tmp.$$"
+mv -f "$ROOT/bin/model-capacity.tmp.$$" "$ROOT/bin/model-capacity"

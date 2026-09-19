@@ -1,0 +1,5 @@
+Signed in as person@example.invalid
+**Amp Megawatt Subscription:** agent usage $20 of $20 remaining (100%), orb usage 746.8h of 750h a1.small orb hours remaining (100%) - period 2026-09-07 to 2026-10-07, ends in 27 days
+**Individual credits:** $2.95 remaining (set up auto-reload to avoid running out) - https://example.invalid/settings
+
+# Run `amp usage --details` for more detailed information.

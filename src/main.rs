@@ -2803,31 +2803,119 @@ fn terminal_width() -> usize {
         .unwrap_or(20)
 }
 
-fn read_key() -> Result<char> {
+enum PaneEvent {
+    Key(char),
+    Resized,
+}
+
+/// Set from the SIGWINCH handler; the pane loop re-renders when it is seen.
+#[cfg(unix)]
+static PANE_RESIZED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_pane_resize(_signal: libc::c_int) {
+    PANE_RESIZED.store(true, Ordering::SeqCst);
+}
+
+/// Clear and report the resize flag. Called right before the width is read so
+/// the flag means "resized since the width this frame was rendered with".
+fn take_pane_resized() -> bool {
+    #[cfg(unix)]
+    {
+        PANE_RESIZED.swap(false, Ordering::SeqCst)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Herdr spawns a plugin pane's PTY at the target pane's size and only applies
+/// the split's own size afterwards. With a warm cache the first render happens
+/// before that resize lands, so the pane must re-render on SIGWINCH rather
+/// than trust its startup width for the rest of its life.
+fn watch_pane_resize() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGWINCH,
+            on_pane_resize as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+fn pane_event() -> Result<PaneEvent> {
     let _ = Command::new("stty").args(["raw", "-echo"]).status();
-    let mut byte = [0_u8; 1];
-    let result = io::stdin().read_exact(&mut byte);
+    let event = wait_for_pane_event();
     let _ = Command::new("stty").arg("sane").status();
-    result.context("read pane key")?;
-    Ok(byte[0] as char)
+    event
+}
+
+#[cfg(unix)]
+fn wait_for_pane_event() -> Result<PaneEvent> {
+    let stdin = io::stdin();
+    let mut poll_fd = libc::pollfd {
+        fd: stdin.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if take_pane_resized() {
+            return Ok(PaneEvent::Resized);
+        }
+        // A short timeout keeps the resize flag observed even where the
+        // signal does not interrupt poll (SA_RESTART semantics on macOS).
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("wait for pane key");
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut byte = [0_u8; 1];
+        stdin
+            .lock()
+            .read_exact(&mut byte)
+            .context("read pane key")?;
+        return Ok(PaneEvent::Key(byte[0] as char));
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_pane_event() -> Result<PaneEvent> {
+    let mut byte = [0_u8; 1];
+    io::stdin().read_exact(&mut byte).context("read pane key")?;
+    Ok(PaneEvent::Key(byte[0] as char))
 }
 
 fn pane_view(compact: bool) -> Result<()> {
     let config = load_config()?;
     let interactive = io::stdin().is_terminal();
+    if interactive {
+        watch_pane_resize();
+    }
     let mut force = false;
     loop {
         let accounts = collect_all(&config, force)?;
-        let width = terminal_width();
-        let output = render(&config, &accounts, compact, width);
-        if !interactive {
-            println!("{output}");
-            return Ok(());
-        }
-        let prompt = truncate_text("[r] refresh · other closes", width);
-        println!("\x1b[2J\x1b[H{output}\n\n\x1b[2m{prompt}\x1b[0m");
-        if !matches!(read_key()?, 'r' | 'R') {
-            return Ok(());
+        loop {
+            take_pane_resized();
+            let width = terminal_width();
+            let output = render(&config, &accounts, compact, width);
+            if !interactive {
+                println!("{output}");
+                return Ok(());
+            }
+            let prompt = truncate_text("[r] refresh · other closes", width);
+            println!("\x1b[2J\x1b[H{output}\n\n\x1b[2m{prompt}\x1b[0m");
+            match pane_event()? {
+                PaneEvent::Resized => continue,
+                PaneEvent::Key('r' | 'R') => break,
+                PaneEvent::Key(_) => return Ok(()),
+            }
         }
         force = true;
     }
@@ -4003,9 +4091,9 @@ mod tests {
 
     #[test]
     fn renders_amp_cards_in_narrow_and_wide_layouts() {
-        let now = DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        // `render` formats resets against the real clock, so the fixture's
+        // "renewal in 29 days" must be parsed relative to now or it expires.
+        let now = Utc::now();
         let mut limits =
             parse_amp_usage_at(include_str!("../tests/fixtures/amp/subscription.txt"), now)
                 .unwrap()

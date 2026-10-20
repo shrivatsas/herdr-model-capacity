@@ -1574,8 +1574,8 @@ fn commandcode_window(name: &str, value: &Value) -> Option<CapacityLimit> {
     Some(limit)
 }
 
-fn parse_commandcode_capacity(credits: &Value, subscription: &Value) -> Result<CollectedCapacity> {
-    let credits = credits.get("credits").unwrap_or(credits);
+fn parse_commandcode_capacity(payload: &Value, subscription: &Value) -> Result<CollectedCapacity> {
+    let credits = payload.get("credits").unwrap_or(payload);
     let monthly = credits
         .get("monthlyCredits")
         .and_then(Value::as_f64)
@@ -1601,7 +1601,10 @@ fn parse_commandcode_capacity(credits: &Value, subscription: &Value) -> Result<C
     if purchased + free > 0.0 {
         limits.push(money_limit("extra credits", purchased + free, None));
     }
-    if let Some(windows) = credits.get("windowLimits") {
+    if let Some(windows) = payload
+        .get("windowLimits")
+        .or_else(|| credits.get("windowLimits"))
+    {
         if windows
             .get("limited")
             .and_then(Value::as_bool)
@@ -3177,12 +3180,12 @@ mod tests {
             "credits": {
                 "monthlyCredits": 42.0,
                 "purchasedCredits": 3.0,
-                "freeCredits": 1.0,
-                "windowLimits": {
-                    "limited": true,
-                    "fiveHour": {"used": 4.0, "cap": 14.0, "resetAt": "2026-09-20T04:00:00Z"},
-                    "weekly": {"used": 10.0, "cap": 35.0, "resetAt": "2026-09-25T04:00:00Z"}
-                }
+                "freeCredits": 1.0
+            },
+            "windowLimits": {
+                "limited": true,
+                "fiveHour": {"used": 4.0, "cap": 14.0, "resetAt": "2026-09-20T04:00:00Z"},
+                "weekly": {"used": 10.0, "cap": 35.0, "resetAt": "2026-09-25T04:00:00Z"}
             }
         });
         let subscription = json!({"data": {"planId": "individual-goat", "monthlyCredits": 70.0}});

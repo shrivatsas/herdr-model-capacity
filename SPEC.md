@@ -205,7 +205,7 @@ Model this around accounts rather than agents:
 
 ```ts
 type CapacityAccount = {
-  provider: "amp" | "anthropic" | "openai" | "openrouter"
+  provider: "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "zen"
 
   accountId: string
   label: string

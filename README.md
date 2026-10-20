@@ -47,6 +47,8 @@ flowchart TD
     E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
     E -->|openrouter| H["openrouter.ai<br/>/api/v1/key + optional /api/v1/credits<br/>environment or macOS Keychain"]
     E -->|amp| I["<b>amp usage</b><br/>single CLI identity<br/>version-1 text parser"]
+    E -->|commandcode| L["Command Code API<br/>subscription credits + rolling windows"]
+    E -->|zen| M["OpenCode Zen API<br/>authenticated key check; balance unavailable"]
 
     F --> J
     G --> J
@@ -236,6 +238,20 @@ used to help author it, but never defines dashboard accounts.
       "label": "Amp billing",
       "authType": "cli",
       "source": "amp-cli"
+    },
+    {
+      "provider": "commandcode",
+      "accountId": "commandcode-personal",
+      "label": "Command Code",
+      "authType": "subscription",
+      "tokenEnv": "COMMAND_CODE_API_KEY"
+    },
+    {
+      "provider": "zen",
+      "accountId": "opencode-zen",
+      "label": "OpenCode Zen",
+      "authType": "api",
+      "tokenEnv": "OPENCODE_API_KEY"
     }
   ]
 }
@@ -267,6 +283,15 @@ guessed. An Amp billing account (`"provider": "amp"`) is independent of an
 optional Amp agent binding; configuring one does not create the other.
 
 ## Provider collection and limitations
+
+### Command Code and OpenCode Zen
+
+Command Code uses `COMMAND_CODE_API_KEY` (or `tokenEnv`/`tokenSecretRef`) to
+collect the official subscription credit balance and its 5-hour and weekly
+windows. OpenCode Zen accepts the same credential configuration and verifies it
+against Zen's authenticated models endpoint. Zen is pay-as-you-go and currently
+does not publish a balance or monthly-spend-limit endpoint for API keys, so it
+is deliberately shown as **unknown**, never as zero.
 
 ### ChatGPT/OpenAI
 

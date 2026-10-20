@@ -477,7 +477,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
     CapacityAccount {
         provider: if matches!(
             spec.provider.as_str(),
-            "amp" | "anthropic" | "openai" | "openrouter"
+            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "zen"
         ) {
             spec.provider.clone()
         } else {
@@ -520,7 +520,7 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
         account.provider = account.provider.to_lowercase();
         if !matches!(
             account.provider.as_str(),
-            "amp" | "anthropic" | "openai" | "openrouter"
+            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "zen"
         ) {
             let detail = format!("unknown provider: {}", account.provider);
             errors.push(unavailable_account(&account, detail));
@@ -596,6 +596,25 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
                 errors.push(unavailable_account(
                     &account,
                     "configure exactly one OpenRouter environment-variable or secret-reference credential source".into(),
+                ));
+                continue;
+            }
+        }
+        if matches!(account.provider.as_str(), "commandcode" | "zen") {
+            if account.secret_ref.is_some()
+                || account.management_key_env.is_some()
+                || account.management_secret_ref.is_some()
+            {
+                errors.push(unavailable_account(
+                    &account,
+                    "use tokenEnv or tokenSecretRef for this provider".into(),
+                ));
+                continue;
+            }
+            if account.token_env.is_some() && account.token_secret_ref.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "configure exactly one environment-variable or secret-reference credential source".into(),
                 ));
                 continue;
             }
@@ -1509,6 +1528,162 @@ fn collect_openrouter_with(
     parse_openrouter_credits(&credits, key.credential_label)
 }
 
+fn token_credential(spec: &AccountSpec, default_env: &str, provider: &str) -> Result<String> {
+    if let Some(name) = &spec.token_env {
+        return env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().into())
+            .ok_or_else(|| {
+                anyhow!("configured {provider} environment variable {name} is not set")
+            });
+    }
+    if let Some(reference) = &spec.token_secret_ref {
+        return resolve_secret_ref(reference);
+    }
+    env::var(default_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().into())
+        .ok_or_else(|| {
+            anyhow!("{provider} credential is unavailable; configure tokenEnv or tokenSecretRef")
+        })
+}
+
+fn bearer_headers(token: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    Ok(headers)
+}
+
+fn commandcode_window(name: &str, value: &Value) -> Option<CapacityLimit> {
+    let used = value.get("used")?.as_f64()?;
+    let cap = value.get("cap")?.as_f64()?;
+    if used < 0.0 || cap <= 0.0 {
+        return None;
+    }
+    let mut limit = quota_limit(
+        name,
+        Some(clamp_percent(used / cap * 100.0)),
+        parse_time(value.get("resetAt")),
+    );
+    limit.detail = format!("${used:.2} of ${cap:.2}");
+    Some(limit)
+}
+
+fn parse_commandcode_capacity(credits: &Value, subscription: &Value) -> Result<CollectedCapacity> {
+    let credits = credits.get("credits").unwrap_or(credits);
+    let monthly = credits
+        .get("monthlyCredits")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let purchased = credits
+        .get("purchasedCredits")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let free = credits
+        .get("freeCredits")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if monthly < 0.0 || purchased < 0.0 || free < 0.0 {
+        return Err(anyhow!("Command Code returned a negative credit balance"));
+    }
+    let mut limits = Vec::new();
+    if monthly > 0.0 {
+        let total = subscription
+            .pointer("/data/monthlyCredits")
+            .and_then(Value::as_f64);
+        limits.push(money_limit("monthly credits", monthly, total));
+    }
+    if purchased + free > 0.0 {
+        limits.push(money_limit("extra credits", purchased + free, None));
+    }
+    if let Some(windows) = credits.get("windowLimits") {
+        if windows
+            .get("limited")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(limit) = windows
+                .get("fiveHour")
+                .and_then(|value| commandcode_window("5h", value))
+            {
+                limits.push(limit);
+            }
+            if let Some(limit) = windows
+                .get("weekly")
+                .and_then(|value| commandcode_window("7d", value))
+            {
+                limits.push(limit);
+            }
+        }
+    }
+    if limits.is_empty() {
+        return Err(anyhow!("Command Code returned no capacity data"));
+    }
+    Ok(CollectedCapacity {
+        limits,
+        credential_label: subscription
+            .pointer("/data/planId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        capacity_scope: "subscription_credits".into(),
+        warning: String::new(),
+    })
+}
+
+fn collect_commandcode(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let token = token_credential(spec, "COMMAND_CODE_API_KEY", "Command Code")?;
+    let headers = bearer_headers(&token)?;
+    let whoami = get_json(
+        "https://api.commandcode.ai/alpha/whoami?limits=1",
+        headers.clone(),
+    )
+    .map_err(|error| anyhow!(format!("{error:#}").replace(&token, "[redacted]")))?;
+    let org_id = whoami
+        .pointer("/org/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let query = if org_id.is_empty() {
+        String::new()
+    } else {
+        format!("?orgId={org_id}")
+    };
+    let credits = get_json(
+        &format!("https://api.commandcode.ai/alpha/billing/credits{query}"),
+        headers.clone(),
+    )?;
+    let subscription = get_json(
+        &format!("https://api.commandcode.ai/alpha/billing/subscriptions{query}"),
+        headers,
+    )?;
+    parse_commandcode_capacity(&credits, &subscription)
+}
+
+fn collect_zen(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let token = token_credential(spec, "OPENCODE_API_KEY", "OpenCode Zen")?;
+    // Zen documents an authenticated models endpoint, but does not expose a
+    // balance or spend-limit endpoint to API keys. Verify the configured key
+    // without fabricating a zero balance, then make that limitation explicit.
+    get_json("https://opencode.ai/zen/v1/models", bearer_headers(&token)?)
+        .map_err(|error| anyhow!(format!("{error:#}").replace(&token, "[redacted]")))?;
+    Ok(CollectedCapacity::limits(vec![CapacityLimit {
+        name: "Zen balance".into(),
+        kind: "balance".into(),
+        unit: "usd".into(),
+        remaining: None,
+        total: None,
+        remaining_percent: None,
+        resets_at: None,
+        status: LimitStatus::Unknown,
+        detail: "Zen does not expose balance or monthly spend-limit data to API keys".into(),
+    }]))
+}
+
 fn money_limit(name: &str, remaining: f64, total: Option<f64>) -> CapacityLimit {
     CapacityLimit {
         name: name.into(),
@@ -1985,8 +2160,10 @@ fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
     match spec.provider.as_str() {
         "amp" => collect_amp(spec),
         "anthropic" => collect_anthropic(spec).map(CollectedCapacity::limits),
+        "commandcode" => collect_commandcode(spec),
         "openai" => collect_openai(spec).map(CollectedCapacity::limits),
         "openrouter" => collect_openrouter(spec),
+        "zen" => collect_zen(spec),
         provider => Err(anyhow!("unknown provider: {provider}")),
     }
 }
@@ -2241,8 +2418,10 @@ fn provider_name(provider: &str) -> &'static str {
     match provider {
         "amp" => "AMP",
         "anthropic" => "CLAUDE",
+        "commandcode" => "COMMAND CODE",
         "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
+        "zen" => "OPENCODE ZEN",
         _ => "CONFIG",
     }
 }
@@ -2251,8 +2430,10 @@ fn provider_color(provider: &str) -> &'static str {
     match provider {
         "amp" => "\x1b[38;5;141m",
         "anthropic" => "\x1b[38;5;173m",
+        "commandcode" => "\x1b[38;5;111m",
         "openai" => "\x1b[38;5;37m",
         "openrouter" => "\x1b[38;5;75m",
+        "zen" => "\x1b[38;5;110m",
         _ => "",
     }
 }
@@ -2683,7 +2864,15 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
         },
         String::new(),
     ];
-    for provider in ["invalid", "amp", "anthropic", "openai", "openrouter"] {
+    for provider in [
+        "invalid",
+        "amp",
+        "anthropic",
+        "commandcode",
+        "openai",
+        "openrouter",
+        "zen",
+    ] {
         let group: Vec<_> = accounts
             .iter()
             .filter(|account| account.provider == provider)
@@ -2979,6 +3168,42 @@ mod tests {
                 (&"7d".into(), Some(82.0)),
                 (&"720h".into(), Some(90.0))
             ]
+        );
+    }
+
+    #[test]
+    fn parses_commandcode_credits_and_subscription_windows() {
+        let credits = json!({
+            "credits": {
+                "monthlyCredits": 42.0,
+                "purchasedCredits": 3.0,
+                "freeCredits": 1.0,
+                "windowLimits": {
+                    "limited": true,
+                    "fiveHour": {"used": 4.0, "cap": 14.0, "resetAt": "2026-09-20T04:00:00Z"},
+                    "weekly": {"used": 10.0, "cap": 35.0, "resetAt": "2026-09-25T04:00:00Z"}
+                }
+            }
+        });
+        let subscription = json!({"data": {"planId": "individual-goat", "monthlyCredits": 70.0}});
+        let collected = parse_commandcode_capacity(&credits, &subscription).unwrap();
+        assert_eq!(collected.credential_label, "individual-goat");
+        assert_eq!(collected.capacity_scope, "subscription_credits");
+        assert_eq!(
+            collected
+                .limits
+                .iter()
+                .map(|limit| limit.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["monthly credits", "extra credits", "5h", "7d"]
+        );
+        assert_eq!(
+            collected.limits[2].remaining_percent,
+            Some(100.0 - 4.0 / 14.0 * 100.0)
+        );
+        assert_eq!(
+            collected.limits[3].remaining_percent,
+            Some(100.0 - 10.0 / 35.0 * 100.0)
         );
     }
 

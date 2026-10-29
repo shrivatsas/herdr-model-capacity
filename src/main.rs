@@ -477,7 +477,7 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
     CapacityAccount {
         provider: if matches!(
             spec.provider.as_str(),
-            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "zen"
+            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "ultramarine" | "zen"
         ) {
             spec.provider.clone()
         } else {
@@ -520,7 +520,7 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
         account.provider = account.provider.to_lowercase();
         if !matches!(
             account.provider.as_str(),
-            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "zen"
+            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "ultramarine" | "zen"
         ) {
             let detail = format!("unknown provider: {}", account.provider);
             errors.push(unavailable_account(&account, detail));
@@ -600,7 +600,10 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
                 continue;
             }
         }
-        if matches!(account.provider.as_str(), "commandcode" | "zen") {
+        if matches!(
+            account.provider.as_str(),
+            "commandcode" | "ultramarine" | "zen"
+        ) {
             if account.secret_ref.is_some()
                 || account.management_key_env.is_some()
                 || account.management_secret_ref.is_some()
@@ -1687,6 +1690,51 @@ fn collect_zen(spec: &AccountSpec) -> Result<CollectedCapacity> {
     }]))
 }
 
+fn parse_ultramarine_capacity(payload: &Value) -> Result<CollectedCapacity> {
+    let available = payload
+        .get("available_nanodollars")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("Ultramarine returned no available balance"))?;
+    let reserved = payload
+        .get("reserved_nanodollars")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if available < 0.0 || reserved < 0.0 {
+        return Err(anyhow!("Ultramarine returned a negative balance"));
+    }
+
+    let mut limit = money_limit("Ultramarine balance", available / 1_000_000_000.0, None);
+    let billing_status = payload
+        .get("billing_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut details = Vec::new();
+    if reserved > 0.0 {
+        details.push(format!("${:.2} reserved", reserved / 1_000_000_000.0));
+    }
+    if !billing_status.is_empty() && billing_status != "active" {
+        details.push(format!("billing {billing_status}"));
+    }
+    limit.detail = details.join("; ");
+
+    Ok(CollectedCapacity {
+        limits: vec![limit],
+        credential_label: String::new(),
+        capacity_scope: "prepaid_balance".into(),
+        warning: String::new(),
+    })
+}
+
+fn collect_ultramarine(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let token = token_credential(spec, "PAPERINSTRUMENTS_API_KEY", "Ultramarine")?;
+    let payload = get_json(
+        "https://api.paperinstruments.com/v1/usage",
+        bearer_headers(&token)?,
+    )
+    .map_err(|error| anyhow!(format!("{error:#}").replace(&token, "[redacted]")))?;
+    parse_ultramarine_capacity(&payload)
+}
+
 fn money_limit(name: &str, remaining: f64, total: Option<f64>) -> CapacityLimit {
     CapacityLimit {
         name: name.into(),
@@ -2166,6 +2214,7 @@ fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
         "commandcode" => collect_commandcode(spec),
         "openai" => collect_openai(spec).map(CollectedCapacity::limits),
         "openrouter" => collect_openrouter(spec),
+        "ultramarine" => collect_ultramarine(spec),
         "zen" => collect_zen(spec),
         provider => Err(anyhow!("unknown provider: {provider}")),
     }
@@ -2424,6 +2473,7 @@ fn provider_name(provider: &str) -> &'static str {
         "commandcode" => "COMMAND CODE",
         "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
+        "ultramarine" => "ULTRAMARINE",
         "zen" => "OPENCODE ZEN",
         _ => "CONFIG",
     }
@@ -2436,6 +2486,7 @@ fn provider_color(provider: &str) -> &'static str {
         "commandcode" => "\x1b[38;5;111m",
         "openai" => "\x1b[38;5;37m",
         "openrouter" => "\x1b[38;5;75m",
+        "ultramarine" => "\x1b[38;5;63m",
         "zen" => "\x1b[38;5;110m",
         _ => "",
     }
@@ -2874,6 +2925,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
         "commandcode",
         "openai",
         "openrouter",
+        "ultramarine",
         "zen",
     ] {
         let group: Vec<_> = accounts
@@ -3208,6 +3260,37 @@ mod tests {
             collected.limits[3].remaining_percent,
             Some(100.0 - 10.0 / 35.0 * 100.0)
         );
+    }
+
+    #[test]
+    fn parses_ultramarine_prepaid_balance() {
+        let payload = json!({
+            "object": "usage_summary",
+            "organization": "org_example",
+            "billing_status": "active",
+            "available_nanodollars": 9_997_241_620_i64,
+            "reserved_nanodollars": 2_500_000_000_i64,
+            "period_start": 1_790_812_800_i64,
+            "period_end": 1_793_491_200_i64,
+            "requests": 15
+        });
+        let collected = parse_ultramarine_capacity(&payload).unwrap();
+        assert_eq!(collected.capacity_scope, "prepaid_balance");
+        assert_eq!(collected.limits.len(), 1);
+        let limit = &collected.limits[0];
+        assert_eq!(limit.name, "Ultramarine balance");
+        assert_eq!(limit.kind, "balance");
+        assert_eq!(limit.unit, "usd");
+        assert!((limit.remaining.unwrap() - 9.99724162).abs() < 1e-9);
+        assert_eq!(limit.total, None);
+        assert_eq!(limit.status, LimitStatus::Ok);
+        assert_eq!(limit.detail, "$2.50 reserved");
+    }
+
+    #[test]
+    fn rejects_invalid_ultramarine_balance() {
+        assert!(parse_ultramarine_capacity(&json!({"billing_status": "active"})).is_err());
+        assert!(parse_ultramarine_capacity(&json!({"available_nanodollars": -1})).is_err());
     }
 
     #[test]

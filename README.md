@@ -247,6 +247,13 @@ used to help author it, but never defines dashboard accounts.
       "tokenEnv": "COMMAND_CODE_API_KEY"
     },
     {
+      "provider": "ultramarine",
+      "accountId": "ultramarine-personal",
+      "label": "Ultramarine",
+      "authType": "api",
+      "tokenEnv": "PAPERINSTRUMENTS_API_KEY"
+    },
+    {
       "provider": "zen",
       "accountId": "opencode-zen",
       "label": "OpenCode Zen",
@@ -292,6 +299,14 @@ windows. OpenCode Zen accepts the same credential configuration and verifies it
 against Zen's authenticated models endpoint. Zen is pay-as-you-go and currently
 does not publish a balance or monthly-spend-limit endpoint for API keys, so it
 is deliberately shown as **unknown**, never as zero.
+
+### Ultramarine (Paper Instruments)
+
+Ultramarine uses `PAPERINSTRUMENTS_API_KEY` (or `tokenEnv`/`tokenSecretRef`) to
+read `GET https://api.paperinstruments.com/v1/usage`. The prepaid balance comes
+from `available_nanodollars`, and any `reserved_nanodollars` held for in-flight
+requests is shown in the limit detail. Ultramarine has no monthly spend cap, so
+the card shows the remaining balance without a percentage or reset time.
 
 ### ChatGPT/OpenAI
 

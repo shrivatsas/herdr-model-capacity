@@ -477,7 +477,14 @@ fn unavailable_account(spec: &AccountSpec, detail: String) -> CapacityAccount {
     CapacityAccount {
         provider: if matches!(
             spec.provider.as_str(),
-            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "ultramarine" | "zen"
+            "amp"
+                | "anthropic"
+                | "antigravity"
+                | "commandcode"
+                | "openai"
+                | "openrouter"
+                | "ultramarine"
+                | "zen"
         ) {
             spec.provider.clone()
         } else {
@@ -520,7 +527,14 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
         account.provider = account.provider.to_lowercase();
         if !matches!(
             account.provider.as_str(),
-            "amp" | "anthropic" | "commandcode" | "openai" | "openrouter" | "ultramarine" | "zen"
+            "amp"
+                | "anthropic"
+                | "antigravity"
+                | "commandcode"
+                | "openai"
+                | "openrouter"
+                | "ultramarine"
+                | "zen"
         ) {
             let detail = format!("unknown provider: {}", account.provider);
             errors.push(unavailable_account(&account, detail));
@@ -600,6 +614,51 @@ fn configured_accounts(config: &Config) -> (Vec<AccountSpec>, Vec<CapacityAccoun
                 continue;
             }
         }
+        if account.provider == "antigravity" {
+            if account.management_key_env.is_some() || account.management_secret_ref.is_some() {
+                errors.push(unavailable_account(
+                    &account,
+                    "use configDir, tokenEnv, tokenSecretRef, or secretRef for Antigravity".into(),
+                ));
+                continue;
+            }
+            let configured_sources = [
+                account.token_env.is_some(),
+                account.token_secret_ref.is_some(),
+                account.secret_ref.is_some(),
+            ]
+            .into_iter()
+            .filter(|configured| *configured)
+            .count();
+            if configured_sources > 1 {
+                errors.push(unavailable_account(
+                    &account,
+                    "configure at most one Antigravity environment-variable or secret-reference credential source"
+                        .into(),
+                ));
+                continue;
+            }
+            let source = account.source.to_ascii_lowercase();
+            if !matches!(
+                source.as_str(),
+                "" | "auto"
+                    | "local"
+                    | "antigravity"
+                    | "ide"
+                    | "app"
+                    | "agy"
+                    | "oauth"
+                    | "cloudcode"
+                    | "gemini-cli"
+                    | "api"
+            ) {
+                errors.push(unavailable_account(
+                    &account,
+                    format!("unsupported Antigravity source: {}", account.source),
+                ));
+                continue;
+            }
+        }
         if matches!(
             account.provider.as_str(),
             "commandcode" | "ultramarine" | "zen"
@@ -667,10 +726,12 @@ fn get_json(url: &str, headers: HeaderMap) -> Result<Value> {
 
 fn post_json(url: &str, body: Value, mut headers: HeaderMap) -> Result<Value> {
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(&format!("herdr-model-capacity/{VERSION}"))?,
-    );
+    if !headers.contains_key(USER_AGENT) {
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("herdr-model-capacity/{VERSION}"))?,
+        );
+    }
     let response = client()?
         .post(url)
         .headers(headers)
@@ -1735,6 +1796,1176 @@ fn collect_ultramarine(spec: &AccountSpec) -> Result<CollectedCapacity> {
     parse_ultramarine_capacity(&payload)
 }
 
+const ANTIGRAVITY_DAILY_CLOUDCODE_BASE: &str = "https://daily-cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_PROD_CLOUDCODE_BASE: &str = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CLOUDCODE_USER_AGENT: &str = "antigravity/2.24.0";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AntigravityProcess {
+    pid: u32,
+    csrf_token: Option<String>,
+    extension_server_port: Option<u16>,
+    app_data_dir: Option<String>,
+    is_agy: bool,
+}
+
+fn split_command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn extract_flag_value(tokens: &[String], flag: &str) -> Option<String> {
+    let prefix = format!("{flag}=");
+    for (index, token) in tokens.iter().enumerate() {
+        if token == flag {
+            if let Some(value) = tokens.get(index + 1) {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+        } else if let Some(value) = token.strip_prefix(&prefix) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_antigravity_processes(
+    ps_output: &str,
+    app_data_filter: Option<&str>,
+) -> Vec<AntigravityProcess> {
+    let filter_lower = app_data_filter.map(|value| value.to_ascii_lowercase());
+    let mut seen = HashSet::new();
+    let mut processes = Vec::new();
+    for line in ps_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((pid_str, command)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.trim().parse::<u32>() else {
+            continue;
+        };
+        let command = command.trim();
+        let tokens = split_command_tokens(command);
+        let Some(executable) = tokens.first() else {
+            continue;
+        };
+        let lower_cmd = command.to_ascii_lowercase();
+        let exe_name = Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let app_data_dir = extract_flag_value(&tokens, "--app_data_dir")
+            .or_else(|| extract_flag_value(&tokens, "--app-data-dir"));
+        let is_desktop_ls = (exe_name.starts_with("language_server_macos")
+            || exe_name.starts_with("language_server_linux")
+            || lower_cmd.contains("language_server_macos")
+            || lower_cmd.contains("language_server_linux"))
+            && (lower_cmd.contains("antigravity")
+                || app_data_dir
+                    .as_deref()
+                    .is_some_and(|dir| dir.to_ascii_lowercase().contains("antigravity")));
+        let is_agy = exe_name == "agy"
+            && !tokens.iter().skip(1).any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "-h" | "--help" | "help" | "version" | "--version" | "update"
+                )
+            });
+        if !is_desktop_ls && !is_agy {
+            continue;
+        }
+        let csrf_token = extract_flag_value(&tokens, "--csrf_token")
+            .or_else(|| extract_flag_value(&tokens, "--csrf-token"));
+        if is_desktop_ls && csrf_token.is_none() {
+            continue;
+        }
+        if let Some(filter) = &filter_lower {
+            let matches_filter = app_data_dir
+                .as_deref()
+                .is_some_and(|dir| dir.to_ascii_lowercase().contains(filter))
+                || lower_cmd.contains(filter);
+            if !matches_filter {
+                continue;
+            }
+        }
+        let extension_server_port = extract_flag_value(&tokens, "--extension_server_port")
+            .or_else(|| extract_flag_value(&tokens, "--extension-server-port"))
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0);
+        if seen.insert(pid) {
+            processes.push(AntigravityProcess {
+                pid,
+                csrf_token,
+                extension_server_port,
+                app_data_dir,
+                is_agy,
+            });
+        }
+    }
+    // Prefer `agy` / Antigravity app language servers ahead of IDE-only servers
+    // because they expose `RetrieveUserQuotaSummary` (5h + 7d grouped windows).
+    processes.sort_by_key(|process| {
+        let is_cli_dir = process
+            .app_data_dir
+            .as_deref()
+            .is_some_and(|dir| dir.to_ascii_lowercase().contains("antigravity-cli"));
+        if process.is_agy || is_cli_dir {
+            0
+        } else if process.extension_server_port.is_none() {
+            1
+        } else {
+            2
+        }
+    });
+    processes
+}
+
+fn parse_loopback_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    let endpoint = endpoint.trim().trim_end_matches("(LISTEN)").trim();
+    let (host, port_str) = endpoint.rsplit_once(':')?;
+    let host = host.trim_matches(|ch| ch == '[' || ch == ']');
+    let is_loopback_or_wildcard = matches!(
+        host,
+        "127.0.0.1" | "::1" | "localhost" | "*" | "0.0.0.0" | "::"
+    );
+    if !is_loopback_or_wildcard {
+        return None;
+    }
+    port_str.parse::<u16>().ok().filter(|port| *port > 0)
+}
+
+fn parse_lsof_listen_ports(output: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        if !line.contains("(LISTEN)") {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            if let Some(port) = parse_loopback_port_from_endpoint(token) {
+                if seen.insert(port) {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports
+}
+
+fn parse_ss_listen_ports(output: &str, pid: u32) -> Vec<u16> {
+    let needle = format!("pid={pid},");
+    let needle_alt = format!("pid={pid})");
+    let mut ports = Vec::new();
+    let mut seen = HashSet::new();
+    for line in output.lines() {
+        if !line.contains(&needle) && !line.contains(&needle_alt) {
+            continue;
+        }
+        // `ss -tlnp` columns: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port Process
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if let Some(local_addr) = fields.get(3) {
+            if let Some(port) = parse_loopback_port_from_endpoint(local_addr) {
+                if seen.insert(port) {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports
+}
+
+fn discover_listening_ports(process: &AntigravityProcess) -> Vec<(u16, bool)> {
+    let mut ports = Vec::new();
+    let mut seen = HashSet::new();
+    if let Ok(output) = Command::new("lsof")
+        .args([
+            "-nP",
+            "-a",
+            "-p",
+            &process.pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+        ])
+        .stdin(Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            for port in parse_lsof_listen_ports(&String::from_utf8_lossy(&output.stdout)) {
+                if seen.insert(port) {
+                    ports.push((port, true));
+                }
+            }
+        }
+    }
+    if ports.is_empty() {
+        if let Ok(output) = Command::new("ss")
+            .args(["-tlnp"])
+            .stdin(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                for port in
+                    parse_ss_listen_ports(&String::from_utf8_lossy(&output.stdout), process.pid)
+                {
+                    if seen.insert(port) {
+                        ports.push((port, true));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ext_port) = process.extension_server_port {
+        if seen.insert(ext_port) {
+            ports.push((ext_port, false));
+        }
+    }
+    ports
+}
+
+fn loopback_client() -> Result<&'static Client> {
+    static LOOPBACK_CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = LOOPBACK_CLIENT.get() {
+        return Ok(client);
+    }
+    // Antigravity's local language server serves a self-signed TLS certificate
+    // on 127.0.0.1. This client is strictly restricted to loopback URLs inside
+    // `post_loopback_json` and is never used for remote endpoints.
+    let client = Client::builder()
+        .timeout(StdDuration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("build loopback HTTP client")?;
+    let _ = LOOPBACK_CLIENT.set(client);
+    Ok(LOOPBACK_CLIENT
+        .get()
+        .expect("loopback HTTP client was initialized"))
+}
+
+fn post_loopback_json(url: &str, body: Value, mut headers: HeaderMap) -> Result<Value> {
+    if !url.starts_with("https://127.0.0.1:") && !url.starts_with("http://127.0.0.1:") {
+        return Err(anyhow!(
+            "refusing loopback client request to non-loopback URL"
+        ));
+    }
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        HeaderName::from_static("connect-protocol-version"),
+        HeaderValue::from_static("1"),
+    );
+    let response = loopback_client()?
+        .post(url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), detail));
+    }
+    response
+        .json()
+        .context("parse Antigravity local server response")
+}
+
+fn post_form_json(url: &str, params: &[(&str, &str)]) -> Result<Value> {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&format!("herdr-model-capacity/{VERSION}"))?,
+    );
+    let response = client()?
+        .post(url)
+        .headers(headers)
+        .form(params)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(anyhow!("HTTP {}: {}", status.as_u16(), detail));
+    }
+    response.json().context("parse OAuth token response")
+}
+
+fn redact_secret_error(error: anyhow::Error, secrets: &[&str]) -> anyhow::Error {
+    let mut text = format!("{error:#}");
+    for secret in secrets {
+        if !secret.is_empty() {
+            text = text.replace(secret, "[redacted]");
+        }
+    }
+    anyhow!(text)
+}
+
+fn antigravity_fraction_to_percent(fraction: Option<f64>) -> Result<Option<f64>> {
+    let Some(value) = fraction else {
+        return Ok(None);
+    };
+    if !value.is_finite() || value < 0.0 || value > 1.0 + 1e-6 {
+        return Err(anyhow!(
+            "Antigravity returned an out-of-range quota fraction"
+        ));
+    }
+    Ok(Some(clamp_percent(value * 100.0)))
+}
+
+fn antigravity_group_label(group_name: &str, bucket_id: &str) -> String {
+    let combined = format!("{group_name} {bucket_id}").to_ascii_lowercase();
+    if combined.contains("gemini") {
+        "Gemini".into()
+    } else if (combined.contains("claude") && combined.contains("gpt"))
+        || combined.contains("3p")
+        || combined.contains("third")
+    {
+        "Cl/GPT".into()
+    } else if combined.contains("claude") {
+        "Claude".into()
+    } else if combined.contains("gpt") {
+        "GPT".into()
+    } else {
+        let cleaned = group_name
+            .trim()
+            .trim_end_matches(" Models")
+            .trim_end_matches(" models")
+            .trim();
+        if cleaned.is_empty() {
+            String::new()
+        } else {
+            truncate_text(cleaned, 7)
+        }
+    }
+}
+
+fn antigravity_window_label(bucket: &Value) -> String {
+    let window = bucket
+        .get("window")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let bucket_id = bucket
+        .get("bucketId")
+        .or_else(|| bucket.get("bucket_id"))
+        .or_else(|| bucket.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let display = bucket
+        .get("displayName")
+        .or_else(|| bucket.get("display_name"))
+        .or_else(|| bucket.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let combined = format!("{window} {bucket_id} {display}").to_ascii_lowercase();
+    if combined.contains("5h")
+        || combined.contains("5-hour")
+        || combined.contains("5 hour")
+        || combined.contains("five_hour")
+        || combined.contains("five-hour")
+        || combined.contains("session")
+    {
+        "5h".into()
+    } else if combined.contains("weekly")
+        || combined.contains("7d")
+        || combined.contains("7-day")
+        || combined.contains("7 day")
+        || combined.contains("week")
+    {
+        "7d".into()
+    } else if combined.contains("daily")
+        || combined.contains("24h")
+        || combined.contains("1d")
+        || combined.contains("day")
+    {
+        "1d".into()
+    } else if !window.trim().is_empty() {
+        window.trim().into()
+    } else if !display.trim().is_empty() {
+        truncate_text(display.trim(), 12)
+    } else {
+        "quota".into()
+    }
+}
+
+fn antigravity_model_pool(label: &str) -> String {
+    let lower = label.to_ascii_lowercase();
+    if lower.contains("gemini") && lower.contains("pro") {
+        "Gemini Pro".into()
+    } else if lower.contains("gemini") && lower.contains("flash") {
+        "Gem Flash".into()
+    } else if lower.contains("gemini") {
+        "Gemini".into()
+    } else if lower.contains("claude")
+        || lower.contains("gpt")
+        || lower.contains("opus")
+        || lower.contains("sonnet")
+        || lower.contains("haiku")
+    {
+        "Claude/GPT".into()
+    } else {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            "quota".into()
+        } else {
+            truncate_text(trimmed, 12)
+        }
+    }
+}
+
+fn antigravity_sort_key(name: &str) -> (u8, u8, String) {
+    let lower = name.to_ascii_lowercase();
+    let family_rank = if lower.contains("gemini pro") || lower.contains("gemini") {
+        0
+    } else if lower.contains("gem flash") {
+        1
+    } else if lower.contains("cl/gpt") || lower.contains("claude") || lower.contains("gpt") {
+        2
+    } else {
+        3
+    };
+    let window_rank = if lower.starts_with("5h") {
+        0
+    } else if lower.starts_with("1d") {
+        1
+    } else if lower.starts_with("7d") {
+        2
+    } else {
+        3
+    };
+    (family_rank, window_rank, lower)
+}
+
+fn parse_antigravity_quota_summary(data: &Value) -> Result<CollectedCapacity> {
+    let root = data.get("response").unwrap_or(data);
+    let groups = root
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Antigravity quota summary omitted groups"))?;
+    let single_group = groups.len() == 1;
+    let mut limits = Vec::new();
+    for group in groups {
+        let group_name = group
+            .get("displayName")
+            .or_else(|| group.get("display_name"))
+            .or_else(|| group.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+            continue;
+        };
+        for bucket in buckets {
+            let bucket_id = bucket
+                .get("bucketId")
+                .or_else(|| bucket.get("bucket_id"))
+                .or_else(|| bucket.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let window = antigravity_window_label(bucket);
+            let family = antigravity_group_label(group_name, bucket_id);
+            let name = if family.is_empty() || (single_group && group_name.trim().is_empty()) {
+                window
+            } else {
+                format!("{window} · {family}")
+            };
+            let fraction = bucket
+                .get("remainingFraction")
+                .or_else(|| bucket.get("remaining_fraction"))
+                .and_then(Value::as_f64);
+            let remaining_percent = antigravity_fraction_to_percent(fraction)?;
+            let reset = parse_time(bucket.get("resetTime").or_else(|| bucket.get("reset_time")));
+            limits.push(CapacityLimit {
+                name,
+                kind: "quota".into(),
+                unit: "percent".into(),
+                remaining: None,
+                total: None,
+                remaining_percent,
+                resets_at: reset,
+                status: if remaining_percent.is_some() {
+                    LimitStatus::Ok
+                } else {
+                    LimitStatus::Unknown
+                },
+                detail: String::new(),
+            });
+        }
+    }
+    if limits.is_empty() {
+        return Err(anyhow!(
+            "Antigravity quota summary contained no quota buckets"
+        ));
+    }
+    limits.sort_by(|left, right| {
+        antigravity_sort_key(&left.name).cmp(&antigravity_sort_key(&right.name))
+    });
+    let plan_label = root
+        .get("planName")
+        .or_else(|| root.get("plan_name"))
+        .or_else(|| root.pointer("/userTier/name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(CollectedCapacity {
+        limits,
+        credential_label: plan_label,
+        capacity_scope: "subscription_quota".into(),
+        warning: String::new(),
+    })
+}
+
+fn aggregate_antigravity_pool_limits(
+    entries: Vec<(String, Option<f64>, Option<DateTime<Utc>>)>,
+    plan_label: String,
+    scope: &str,
+) -> Result<CollectedCapacity> {
+    let mut pools: HashMap<String, (Option<f64>, Option<DateTime<Utc>>)> = HashMap::new();
+    for (pool, percent, reset) in entries {
+        pools
+            .entry(pool)
+            .and_modify(
+                |(existing_percent, existing_reset)| match (*existing_percent, percent) {
+                    (Some(cur), Some(new)) if new < cur => {
+                        *existing_percent = Some(new);
+                        *existing_reset = reset.or(*existing_reset);
+                    }
+                    (Some(cur), Some(new)) if (new - cur).abs() < f64::EPSILON => {
+                        *existing_reset = match (*existing_reset, reset) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                    (None, Some(new)) => {
+                        *existing_percent = Some(new);
+                        *existing_reset = reset.or(*existing_reset);
+                    }
+                    _ => {}
+                },
+            )
+            .or_insert((percent, reset));
+    }
+    if pools.is_empty() {
+        return Err(anyhow!("Antigravity returned no model quota data"));
+    }
+    let mut limits: Vec<CapacityLimit> = pools
+        .into_iter()
+        .map(|(name, (remaining_percent, resets_at))| CapacityLimit {
+            name,
+            kind: "quota".into(),
+            unit: "percent".into(),
+            remaining: None,
+            total: None,
+            remaining_percent,
+            resets_at,
+            status: if remaining_percent.is_some() {
+                LimitStatus::Ok
+            } else {
+                LimitStatus::Unknown
+            },
+            detail: String::new(),
+        })
+        .collect();
+    limits.sort_by(|left, right| {
+        antigravity_sort_key(&left.name).cmp(&antigravity_sort_key(&right.name))
+    });
+    Ok(CollectedCapacity {
+        limits,
+        credential_label: plan_label,
+        capacity_scope: scope.into(),
+        warning: String::new(),
+    })
+}
+
+fn parse_antigravity_model_configs(
+    configs: &[Value],
+    plan_label: String,
+) -> Result<CollectedCapacity> {
+    let mut entries = Vec::new();
+    for config in configs {
+        let Some(quota_info) = config
+            .get("quotaInfo")
+            .or_else(|| config.get("quota_info"))
+            .filter(|value| value.is_object())
+        else {
+            continue;
+        };
+        let label = config
+            .get("label")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                config
+                    .pointer("/modelOrAlias/model")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| config.get("modelId").and_then(Value::as_str))
+            .unwrap_or_default();
+        let fraction = quota_info
+            .get("remainingFraction")
+            .or_else(|| quota_info.get("remaining_fraction"))
+            .and_then(Value::as_f64);
+        let percent = antigravity_fraction_to_percent(fraction)?;
+        let reset = parse_time(
+            quota_info
+                .get("resetTime")
+                .or_else(|| quota_info.get("reset_time")),
+        );
+        entries.push((antigravity_model_pool(label), percent, reset));
+    }
+    aggregate_antigravity_pool_limits(entries, plan_label, "model_quota")
+}
+
+fn parse_antigravity_user_status(data: &Value) -> Result<CollectedCapacity> {
+    let status = data
+        .get("userStatus")
+        .or_else(|| data.get("user_status"))
+        .unwrap_or(data);
+    let plan_label = status
+        .pointer("/planStatus/planInfo/planName")
+        .or_else(|| status.pointer("/userTier/name"))
+        .or_else(|| status.pointer("/planStatus/planInfo/teamsTier"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let configs = status
+        .pointer("/cascadeModelConfigData/clientModelConfigs")
+        .or_else(|| status.get("clientModelConfigs"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Antigravity user status omitted model quota configs"))?;
+    parse_antigravity_model_configs(configs, plan_label)
+}
+
+fn parse_antigravity_cloudcode_quota(
+    data: &Value,
+    tier_label: String,
+) -> Result<CollectedCapacity> {
+    let buckets = data
+        .get("buckets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Google Cloud Code quota response omitted buckets"))?;
+    let mut entries = Vec::new();
+    for bucket in buckets {
+        let model_id = bucket
+            .get("modelId")
+            .or_else(|| bucket.get("model_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let fraction = bucket
+            .get("remainingFraction")
+            .or_else(|| bucket.get("remaining_fraction"))
+            .and_then(Value::as_f64);
+        let percent = antigravity_fraction_to_percent(fraction)?;
+        let reset = parse_time(bucket.get("resetTime").or_else(|| bucket.get("reset_time")));
+        entries.push((antigravity_model_pool(model_id), percent, reset));
+    }
+    aggregate_antigravity_pool_limits(entries, tier_label, "subscription_quota")
+}
+
+fn antigravity_local_headers(csrf_token: Option<&str>) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = csrf_token {
+        headers.insert(
+            HeaderName::from_static("x-codeium-csrf-token"),
+            HeaderValue::from_str(token)?,
+        );
+    }
+    Ok(headers)
+}
+
+fn collect_antigravity_from_endpoint_with(
+    base_url: &str,
+    csrf_token: Option<&str>,
+    mut post: impl FnMut(&str, Value, HeaderMap) -> Result<Value>,
+) -> Result<(CollectedCapacity, bool)> {
+    let headers = antigravity_local_headers(csrf_token)?;
+    let redact = |error: anyhow::Error| {
+        if let Some(token) = csrf_token {
+            redact_secret_error(error, &[token])
+        } else {
+            error
+        }
+    };
+    let summary_url =
+        format!("{base_url}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
+    if let Ok(payload) = post(&summary_url, json!({}), headers.clone()) {
+        if let Ok(collected) = parse_antigravity_quota_summary(&payload) {
+            return Ok((collected, true));
+        }
+    }
+    let metadata_body = json!({
+        "metadata": {
+            "ideName": "antigravity",
+            "extensionName": "antigravity",
+            "locale": "en"
+        }
+    });
+    let status_url =
+        format!("{base_url}/exa.language_server_pb.LanguageServerService/GetUserStatus");
+    let status_err = match post(&status_url, metadata_body.clone(), headers.clone()) {
+        Ok(payload) => match parse_antigravity_user_status(&payload) {
+            Ok(collected) => return Ok((collected, false)),
+            Err(error) => Some(redact(error)),
+        },
+        Err(error) => Some(redact(error)),
+    };
+    let configs_url =
+        format!("{base_url}/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs");
+    match post(&configs_url, metadata_body, headers) {
+        Ok(payload) => {
+            let configs = payload
+                .get("clientModelConfigs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("Antigravity command model configs omitted models"))?;
+            Ok((
+                parse_antigravity_model_configs(configs, String::new())?,
+                false,
+            ))
+        }
+        Err(error) => Err(status_err.unwrap_or_else(|| redact(error))),
+    }
+}
+
+fn collect_antigravity_local(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let ps = Command::new("ps")
+        .args(["-ax", "-o", "pid=,command="])
+        .stdin(Stdio::null())
+        .output()
+        .context("list running Antigravity processes")?;
+    if !ps.status.success() {
+        return Err(anyhow!("could not inspect running processes via ps"));
+    }
+    let filter = spec.config_dir.as_ref().map(|path| {
+        expand_home(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| expand_home(path).display().to_string())
+    });
+    let processes =
+        parse_antigravity_processes(&String::from_utf8_lossy(&ps.stdout), filter.as_deref());
+    if processes.is_empty() {
+        return Err(anyhow!(
+            "Antigravity language server is not running; open Antigravity or agy"
+        ));
+    }
+    let mut best_fallback: Option<CollectedCapacity> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    for process in &processes {
+        let ports = discover_listening_ports(process);
+        for (port, prefer_https) in ports {
+            let schemes = if prefer_https {
+                ["https", "http"]
+            } else {
+                ["http", "https"]
+            };
+            for scheme in schemes {
+                let base_url = format!("{scheme}://127.0.0.1:{port}");
+                match collect_antigravity_from_endpoint_with(
+                    &base_url,
+                    process.csrf_token.as_deref(),
+                    post_loopback_json,
+                ) {
+                    Ok((collected, true)) => return Ok(collected),
+                    Ok((collected, false)) => {
+                        if best_fallback.is_none() {
+                            best_fallback = Some(collected);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(fallback) = best_fallback {
+        return Ok(fallback);
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!("could not reach Antigravity local language server on loopback")
+    }))
+}
+
+enum AntigravityOAuthStore {
+    None,
+    File(PathBuf),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Keychain {
+        service: String,
+        account: String,
+    },
+}
+
+impl AntigravityOAuthStore {
+    #[cfg(target_os = "macos")]
+    fn from_secret_ref(reference: &SecretRef) -> Self {
+        Self::Keychain {
+            service: reference.service.clone(),
+            account: reference.account.clone(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn from_secret_ref(_reference: &SecretRef) -> Self {
+        Self::None
+    }
+
+    fn save(&self, oauth: &Value) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::File(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let temporary = path.with_extension("json.tmp");
+                fs::write(&temporary, serde_json::to_vec(oauth).unwrap_or_default())
+                    .with_context(|| format!("write {}", temporary.display()))?;
+                fs::rename(&temporary, path)
+                    .with_context(|| format!("rename {}", path.display()))?;
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Self::Keychain { service, account } => {
+                let bytes = serde_json::to_vec(oauth)
+                    .context("serialize refreshed Antigravity OAuth payload")?;
+                let hex = hex_lower(&bytes);
+                let output = Command::new("security")
+                    .args([
+                        "add-generic-password",
+                        "-U",
+                        "-a",
+                        account,
+                        "-s",
+                        service,
+                        "-X",
+                        &hex,
+                    ])
+                    .output()
+                    .context("update macOS Keychain Antigravity OAuth item")?;
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "macOS Keychain update for {service} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Keychain { .. } => Ok(()),
+        }
+    }
+}
+
+fn parse_antigravity_oauth_value(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if value.is_object() {
+            return value;
+        }
+    }
+    json!({ "access_token": trimmed })
+}
+
+fn antigravity_oauth_access_token(oauth: &Value) -> Option<&str> {
+    oauth
+        .get("access_token")
+        .or_else(|| oauth.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn antigravity_oauth_expiry(oauth: &Value) -> Option<DateTime<Utc>> {
+    parse_time(
+        oauth
+            .get("expiry_date")
+            .or_else(|| oauth.get("expires_at"))
+            .or_else(|| oauth.get("expiresAt")),
+    )
+}
+
+fn refresh_antigravity_oauth_with(
+    oauth: &Value,
+    env_value: impl Fn(&str) -> Option<String>,
+    post_form: impl FnOnce(&str, &[(&str, &str)]) -> Result<Value>,
+) -> Result<Value> {
+    let refresh_token = oauth
+        .get("refresh_token")
+        .or_else(|| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("no refresh token to refresh Google OAuth access token"))?;
+    let client_id = oauth
+        .get("client_id")
+        .or_else(|| oauth.get("clientId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| env_value("ANTIGRAVITY_OAUTH_CLIENT_ID"))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "Google OAuth access token expired and no client_id or ANTIGRAVITY_OAUTH_CLIENT_ID is configured to refresh it"
+            )
+        })?;
+    let client_secret = oauth
+        .get("client_secret")
+        .or_else(|| oauth.get("clientSecret"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| env_value("ANTIGRAVITY_OAUTH_CLIENT_SECRET"))
+        .filter(|value| !value.trim().is_empty());
+    let mut params = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id.as_str()),
+    ];
+    if let Some(secret) = client_secret.as_deref() {
+        params.push(("client_secret", secret));
+    }
+    let response = post_form(GOOGLE_OAUTH_TOKEN_URL, &params).map_err(|error| {
+        let mut secrets = vec![refresh_token];
+        if let Some(secret) = client_secret.as_deref() {
+            secrets.push(secret);
+        }
+        redact_secret_error(error, &secrets)
+    })?;
+    let access_token = response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Google OAuth refresh response missing access_token"))?;
+    let expires_in = response
+        .get("expires_in")
+        .and_then(Value::as_f64)
+        .unwrap_or(3600.0);
+    let now_ms = Utc::now().timestamp_millis();
+    let mut merged = oauth.clone();
+    merged["access_token"] = json!(access_token);
+    if let Some(new_rt) = response.get("refresh_token").and_then(Value::as_str) {
+        merged["refresh_token"] = json!(new_rt);
+    }
+    merged["expiry_date"] = json!(now_ms + (expires_in * 1000.0) as i64);
+    Ok(merged)
+}
+
+fn antigravity_oauth_credential(spec: &AccountSpec) -> Result<(Value, AntigravityOAuthStore)> {
+    if let Some(name) = &spec.token_env {
+        let raw = env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("configured Antigravity environment variable {name} is not set")
+            })?;
+        return Ok((
+            parse_antigravity_oauth_value(&raw),
+            AntigravityOAuthStore::None,
+        ));
+    }
+    if let Some(reference) = spec.token_secret_ref.as_ref().or(spec.secret_ref.as_ref()) {
+        let raw = resolve_secret_ref(reference)?;
+        return Ok((
+            parse_antigravity_oauth_value(&raw),
+            AntigravityOAuthStore::from_secret_ref(reference),
+        ));
+    }
+    let dir = spec
+        .config_dir
+        .as_ref()
+        .map(expand_home)
+        .unwrap_or_else(|| home_dir().join(".gemini"));
+    for filename in ["oauth_creds.json", "credentials.json"] {
+        let candidate = dir.join(filename);
+        if let Some(value) = read_json(&candidate) {
+            return Ok((value, AntigravityOAuthStore::File(candidate)));
+        }
+    }
+    Err(anyhow!(
+        "no Google OAuth credential found in {}",
+        dir.display()
+    ))
+}
+
+fn antigravity_cloudcode_headers(token: &str) -> Result<HeaderMap> {
+    let mut headers = bearer_headers(token)?;
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(ANTIGRAVITY_CLOUDCODE_USER_AGENT),
+    );
+    Ok(headers)
+}
+
+fn collect_antigravity_cloudcode_with(
+    oauth: &Value,
+    store: &AntigravityOAuthStore,
+    mut post: impl FnMut(&str, Value, HeaderMap) -> Result<Value>,
+    refresh: impl FnOnce(&Value) -> Result<Value>,
+) -> Result<CollectedCapacity> {
+    let now = Utc::now();
+    let expired = antigravity_oauth_expiry(oauth).is_some_and(|expires| expires <= now);
+    let has_refresh = oauth
+        .get("refresh_token")
+        .or_else(|| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let oauth = if expired && has_refresh {
+        let refreshed = refresh(oauth)?;
+        if let Err(error) = store.save(&refreshed) {
+            eprintln!("herdr: failed to persist refreshed Antigravity OAuth: {error:#}");
+        }
+        refreshed
+    } else {
+        oauth.clone()
+    };
+    if antigravity_oauth_expiry(&oauth).is_some_and(|expires| expires <= Utc::now()) {
+        return Err(anyhow!(
+            "Google OAuth access token expired; re-authenticate in Antigravity or Gemini CLI"
+        ));
+    }
+    let token = antigravity_oauth_access_token(&oauth)
+        .ok_or_else(|| anyhow!("Google OAuth credential is missing access_token"))?;
+    let headers = antigravity_cloudcode_headers(token)?;
+    let redact = |error: anyhow::Error| redact_secret_error(error, &[token]);
+
+    let mut summary_error = None;
+    for base in [
+        ANTIGRAVITY_DAILY_CLOUDCODE_BASE,
+        ANTIGRAVITY_PROD_CLOUDCODE_BASE,
+    ] {
+        let url = format!("{base}/v1internal:retrieveUserQuotaSummary");
+        match post(&url, json!({}), headers.clone()) {
+            Ok(payload) => {
+                if let Ok(collected) = parse_antigravity_quota_summary(&payload) {
+                    return Ok(collected);
+                }
+            }
+            Err(error) => {
+                summary_error = Some(redact(error));
+            }
+        }
+    }
+
+    let load_url = format!("{ANTIGRAVITY_PROD_CLOUDCODE_BASE}/v1internal:loadCodeAssist");
+    let load_body = json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI"
+        }
+    });
+    let (project_id, tier_label) = match post(&load_url, load_body, headers.clone()) {
+        Ok(payload) => {
+            let project = payload
+                .get("cloudaicompanionProject")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("id").and_then(Value::as_str))
+                })
+                .map(str::to_string);
+            let tier = payload
+                .pointer("/paidTier/name")
+                .or_else(|| payload.pointer("/currentTier/name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (project, tier)
+        }
+        Err(_) => (None, String::new()),
+    };
+
+    let quota_url = format!("{ANTIGRAVITY_PROD_CLOUDCODE_BASE}/v1internal:retrieveUserQuota");
+    let quota_body = match project_id {
+        Some(project) if !project.is_empty() => json!({ "project": project }),
+        _ => json!({}),
+    };
+    match post(&quota_url, quota_body, headers) {
+        Ok(payload) => parse_antigravity_cloudcode_quota(&payload, tier_label),
+        Err(error) => Err(summary_error.unwrap_or_else(|| redact(error))),
+    }
+}
+
+fn collect_antigravity_oauth(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let (oauth, store) = antigravity_oauth_credential(spec)?;
+    collect_antigravity_cloudcode_with(&oauth, &store, post_json, |value| {
+        refresh_antigravity_oauth_with(value, |name| env::var(name).ok(), post_form_json)
+    })
+}
+
+fn collect_antigravity(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    let source = spec.source.to_ascii_lowercase();
+    if spec.auth_type.eq_ignore_ascii_case("api") || source == "api" {
+        return Ok(CollectedCapacity::limits(unknown_balance(
+            "Google AI Studio exposes no prepaid balance endpoint for ordinary API keys",
+        )));
+    }
+    let has_explicit_oauth =
+        spec.token_env.is_some() || spec.token_secret_ref.is_some() || spec.secret_ref.is_some();
+    match source.as_str() {
+        "local" | "antigravity" | "ide" | "app" | "agy" => collect_antigravity_local(spec),
+        "oauth" | "cloudcode" | "gemini-cli" => collect_antigravity_oauth(spec),
+        _ if has_explicit_oauth => collect_antigravity_oauth(spec),
+        _ => match collect_antigravity_local(spec) {
+            Ok(collected) => Ok(collected),
+            Err(local_error) => match collect_antigravity_oauth(spec) {
+                Ok(collected) => Ok(collected),
+                Err(_) => Err(anyhow!(
+                    "{local_error:#}; or configure configDir, tokenEnv, or tokenSecretRef"
+                )),
+            },
+        },
+    }
+}
+
 fn money_limit(name: &str, remaining: f64, total: Option<f64>) -> CapacityLimit {
     CapacityLimit {
         name: name.into(),
@@ -2211,6 +3442,7 @@ fn collect_limits(spec: &AccountSpec) -> Result<CollectedCapacity> {
     match spec.provider.as_str() {
         "amp" => collect_amp(spec),
         "anthropic" => collect_anthropic(spec).map(CollectedCapacity::limits),
+        "antigravity" => collect_antigravity(spec),
         "commandcode" => collect_commandcode(spec),
         "openai" => collect_openai(spec).map(CollectedCapacity::limits),
         "openrouter" => collect_openrouter(spec),
@@ -2470,6 +3702,7 @@ fn provider_name(provider: &str) -> &'static str {
     match provider {
         "amp" => "AMP",
         "anthropic" => "CLAUDE",
+        "antigravity" => "GOOGLE ANTIGRAVITY",
         "commandcode" => "COMMAND CODE",
         "openai" => "CHATGPT / OPENAI",
         "openrouter" => "OPENROUTER",
@@ -2483,6 +3716,7 @@ fn provider_color(provider: &str) -> &'static str {
     match provider {
         "amp" => "\x1b[38;5;141m",
         "anthropic" => "\x1b[38;5;173m",
+        "antigravity" => "\x1b[38;5;39m",
         "commandcode" => "\x1b[38;5;111m",
         "openai" => "\x1b[38;5;37m",
         "openrouter" => "\x1b[38;5;75m",
@@ -2769,10 +4003,12 @@ fn automatic_provider(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" | "claude-code" => Some("anthropic"),
         "codex" => Some("openai"),
+        "antigravity" | "agy" | "gemini" | "gemini-cli" => Some("antigravity"),
         "pi" => {
             let settings = read_json(home_dir().join(".pi/agent/settings.json"))?;
             match settings.get("defaultProvider").and_then(Value::as_str)? {
                 "anthropic" => Some("anthropic"),
+                "google" | "google-antigravity" | "google-gemini-cli" => Some("antigravity"),
                 "openai" | "openai-codex" => Some("openai"),
                 "openrouter" => Some("openrouter"),
                 _ => None,
@@ -2822,6 +4058,8 @@ fn agent_name(agent: &str) -> &'static str {
     match agent {
         "claude" | "claude-code" => "Claude Code",
         "codex" => "Codex",
+        "antigravity" | "agy" => "Antigravity",
+        "gemini" | "gemini-cli" => "Gemini CLI",
         "pi" => "Pi",
         "amp" | "ampcode" => "Ampcode",
         _ => "",
@@ -2922,6 +4160,7 @@ fn render(config: &Config, accounts: &[CapacityAccount], compact: bool, width: u
         "invalid",
         "amp",
         "anthropic",
+        "antigravity",
         "commandcode",
         "openai",
         "openrouter",
@@ -4875,6 +6114,468 @@ mod tests {
             management_secret_ref: None,
             pi_auth_path: None,
             amp_settings_path: None,
+        }
+    }
+
+    #[test]
+    fn parses_antigravity_quota_summary_groups_and_windows() {
+        let payload = json!({
+            "response": {
+                "planName": "Google AI Pro",
+                "groups": [
+                    {
+                        "displayName": "Claude & GPT Models",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "displayName": "Weekly Limit",
+                                "window": "weekly",
+                                "remainingFraction": 0.42,
+                                "resetTime": "2026-11-24T10:00:00Z"
+                            },
+                            {
+                                "bucketId": "3p-5h",
+                                "displayName": "5-Hour Window",
+                                "window": "5h",
+                                "remainingFraction": 0.0,
+                                "resetTime": "2026-11-20T18:45:00Z"
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "5-Hour Window",
+                                "window": "5h",
+                                "remainingFraction": 0.93,
+                                "resetTime": "2026-11-20T21:30:00Z"
+                            },
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit",
+                                "window": "weekly"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let collected = parse_antigravity_quota_summary(&payload).unwrap();
+        assert_eq!(collected.credential_label, "Google AI Pro");
+        assert_eq!(collected.capacity_scope, "subscription_quota");
+        assert_eq!(collected.limits.len(), 4);
+        assert_eq!(collected.limits[0].name, "5h · Gemini");
+        assert!((collected.limits[0].remaining_percent.unwrap() - 93.0).abs() < 1e-6);
+        assert_eq!(collected.limits[0].status, LimitStatus::Ok);
+        assert!(collected.limits[0].resets_at.is_some());
+
+        // Missing remainingFraction stays Unknown, never fabricated as zero.
+        assert_eq!(collected.limits[1].name, "7d · Gemini");
+        assert_eq!(collected.limits[1].remaining_percent, None);
+        assert_eq!(collected.limits[1].status, LimitStatus::Unknown);
+
+        // Explicit 0.0 fraction is distinct from unknown.
+        assert_eq!(collected.limits[2].name, "5h · Cl/GPT");
+        assert_eq!(collected.limits[2].remaining_percent, Some(0.0));
+        assert_eq!(collected.limits[2].status, LimitStatus::Ok);
+
+        assert_eq!(collected.limits[3].name, "7d · Cl/GPT");
+        assert!((collected.limits[3].remaining_percent.unwrap() - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_antigravity_out_of_range_quota_fraction() {
+        let negative = json!({
+            "groups": [{
+                "displayName": "Gemini Models",
+                "buckets": [{
+                    "bucketId": "gemini-5h",
+                    "remainingFraction": -0.1
+                }]
+            }]
+        });
+        assert!(parse_antigravity_quota_summary(&negative).is_err());
+
+        let too_large = json!({
+            "buckets": [{
+                "modelId": "gemini-2.5-pro",
+                "remainingFraction": 1.5
+            }]
+        });
+        assert!(parse_antigravity_cloudcode_quota(&too_large, String::new()).is_err());
+    }
+
+    #[test]
+    fn parses_antigravity_user_status_and_aggregates_model_pools() {
+        let payload = json!({
+            "userStatus": {
+                "email": "private@example.com",
+                "name": "Private Name",
+                "planStatus": {
+                    "planInfo": {
+                        "planName": "Google AI Ultra",
+                        "teamsTier": "TEAMS_TIER_PRO"
+                    }
+                },
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": "Gemini 3.1 Pro (High)",
+                            "quotaInfo": {
+                                "remainingFraction": 0.65,
+                                "resetTime": "2026-11-20T22:00:00Z"
+                            }
+                        },
+                        {
+                            "label": "Gemini 3.1 Pro (Low)",
+                            "quotaInfo": {
+                                "remainingFraction": 0.90,
+                                "resetTime": "2026-11-20T23:00:00Z"
+                            }
+                        },
+                        {
+                            "label": "Gemini 3 Flash",
+                            "quotaInfo": {
+                                "remainingFraction": 1.0,
+                                "resetTime": "2026-11-20T22:00:00Z"
+                            }
+                        },
+                        {
+                            "label": "Claude Sonnet 4.5 (Thinking)",
+                            "quotaInfo": {
+                                "remainingFraction": 0.35,
+                                "resetTime": "2026-11-20T20:00:00Z"
+                            }
+                        },
+                        {
+                            "label": "GPT-OSS 120B",
+                            "quotaInfo": {
+                                "remainingFraction": 0.50,
+                                "resetTime": "2026-11-20T21:00:00Z"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let collected = parse_antigravity_user_status(&payload).unwrap();
+        assert_eq!(collected.credential_label, "Google AI Ultra");
+        assert!(!collected.credential_label.contains("private@example.com"));
+        assert_eq!(collected.limits.len(), 3);
+        assert_eq!(collected.limits[0].name, "Gemini Pro");
+        assert!((collected.limits[0].remaining_percent.unwrap() - 65.0).abs() < 1e-6);
+        assert_eq!(collected.limits[1].name, "Gem Flash");
+        assert!((collected.limits[1].remaining_percent.unwrap() - 100.0).abs() < 1e-6);
+        assert_eq!(collected.limits[2].name, "Claude/GPT");
+        assert!((collected.limits[2].remaining_percent.unwrap() - 35.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_antigravity_cloudcode_buckets() {
+        let payload = json!({
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-flash",
+                    "remainingFraction": 0.95,
+                    "resetTime": "2026-11-20T21:00:00Z"
+                },
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.80,
+                    "resetTime": "2026-11-20T20:00:00Z"
+                }
+            ]
+        });
+        let collected =
+            parse_antigravity_cloudcode_quota(&payload, "Google AI Pro".into()).unwrap();
+        assert_eq!(collected.credential_label, "Google AI Pro");
+        assert_eq!(collected.limits.len(), 2);
+        assert_eq!(collected.limits[0].name, "Gemini Pro");
+        assert!((collected.limits[0].remaining_percent.unwrap() - 80.0).abs() < 1e-6);
+        assert_eq!(collected.limits[1].name, "Gem Flash");
+        assert!((collected.limits[1].remaining_percent.unwrap() - 95.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_antigravity_processes_and_listening_ports() {
+        let ps_output = "\
+  101 /usr/share/antigravity/language_server_linux_x64 --app_data_dir antigravity --extension_server_port 41234 --csrf_token ide-secret
+  102 /usr/share/antigravity/language_server_linux_x64 --app_data_dir antigravity
+  103 /home/user/.local/bin/agy --app-data-dir antigravity-cli
+  104 /home/user/.local/bin/agy --help
+  105 /usr/bin/unrelated_server --csrf_token other
+";
+        let processes = parse_antigravity_processes(ps_output, None);
+        // Tokenless desktop language server (102), `agy --help` (104), and unrelated (105) skipped.
+        assert_eq!(processes.len(), 2);
+        // `agy` CLI process is prioritized ahead of IDE language server.
+        assert_eq!(processes[0].pid, 103);
+        assert!(processes[0].is_agy);
+        assert_eq!(processes[1].pid, 101);
+        assert_eq!(processes[1].csrf_token.as_deref(), Some("ide-secret"));
+        assert_eq!(processes[1].extension_server_port, Some(41234));
+
+        let filtered = parse_antigravity_processes(ps_output, Some("antigravity-cli"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, 103);
+
+        let lsof_output = "\
+COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+language_ 101 user   12u  IPv4  12345      0t0  TCP 127.0.0.1:45123 (LISTEN)
+language_ 101 user   13u  IPv6  12346      0t0  TCP [::1]:45124 (LISTEN)
+language_ 101 user   14u  IPv4  12347      0t0  TCP 192.168.1.5:8080 (LISTEN)
+";
+        assert_eq!(parse_lsof_listen_ports(lsof_output), vec![45123, 45124]);
+
+        let ss_output = "\
+State   Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+LISTEN  0      128    127.0.0.1:45123     0.0.0.0:*         users:((\"language_server\",pid=101,fd=12))
+LISTEN  0      128    127.0.0.1:49999     0.0.0.0:*         users:((\"other\",pid=999,fd=3))
+";
+        assert_eq!(parse_ss_listen_ports(ss_output, 101), vec![45123]);
+    }
+
+    #[test]
+    fn antigravity_local_endpoint_falls_back_from_summary_to_status_and_redacts_csrf() {
+        let mut calls = Vec::new();
+        let (collected, is_summary) = collect_antigravity_from_endpoint_with(
+            "https://127.0.0.1:45123",
+            Some("super-secret-csrf"),
+            |url, _body, headers| {
+                assert_eq!(
+                    headers
+                        .get("x-codeium-csrf-token")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("super-secret-csrf")
+                );
+                calls.push(url.to_string());
+                if url.ends_with("RetrieveUserQuotaSummary") {
+                    Err(anyhow!("HTTP 404: not found"))
+                } else {
+                    Ok(json!({
+                        "userStatus": {
+                            "cascadeModelConfigData": {
+                                "clientModelConfigs": [{
+                                    "label": "Gemini 3.1 Pro (High)",
+                                    "quotaInfo": { "remainingFraction": 0.75 }
+                                }]
+                            }
+                        }
+                    }))
+                }
+            },
+        )
+        .unwrap();
+        assert!(!is_summary);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(collected.limits[0].name, "Gemini Pro");
+        assert!((collected.limits[0].remaining_percent.unwrap() - 75.0).abs() < 1e-6);
+
+        let error = collect_antigravity_from_endpoint_with(
+            "https://127.0.0.1:45123",
+            Some("super-secret-csrf"),
+            |_url, _body, _headers| Err(anyhow!("rejected super-secret-csrf")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("super-secret-csrf"));
+        assert!(message.contains("[redacted]"));
+    }
+
+    #[test]
+    fn antigravity_cloudcode_refreshes_expired_oauth_and_falls_back_to_retrieve_user_quota() {
+        let expired_oauth = json!({
+            "access_token": "old-access-token",
+            "refresh_token": "secret-refresh-token",
+            "expiry_date": (Utc::now() - Duration::hours(1)).timestamp_millis(),
+            "client_id": "test-client-id"
+        });
+        let refreshed = refresh_antigravity_oauth_with(
+            &expired_oauth,
+            |_| None,
+            |url, params| {
+                assert_eq!(url, GOOGLE_OAUTH_TOKEN_URL);
+                assert!(params.contains(&("grant_type", "refresh_token")));
+                assert!(params.contains(&("refresh_token", "secret-refresh-token")));
+                assert!(params.contains(&("client_id", "test-client-id")));
+                Ok(json!({
+                    "access_token": "fresh-access-token",
+                    "expires_in": 3600
+                }))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed.get("access_token").and_then(Value::as_str),
+            Some("fresh-access-token")
+        );
+
+        let collected = collect_antigravity_cloudcode_with(
+            &expired_oauth,
+            &AntigravityOAuthStore::None,
+            |url, _body, headers| {
+                assert_eq!(
+                    headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+                    Some("Bearer fresh-access-token")
+                );
+                assert_eq!(
+                    headers.get(USER_AGENT).and_then(|v| v.to_str().ok()),
+                    Some(ANTIGRAVITY_CLOUDCODE_USER_AGENT)
+                );
+                if url.contains("retrieveUserQuotaSummary") {
+                    Err(anyhow!("HTTP 404: unsupported"))
+                } else if url.contains("loadCodeAssist") {
+                    Ok(json!({
+                        "cloudaicompanionProject": "proj-123",
+                        "paidTier": { "name": "Google AI Pro" }
+                    }))
+                } else {
+                    Ok(json!({
+                        "buckets": [{
+                            "modelId": "gemini-2.5-pro",
+                            "remainingFraction": 0.60,
+                            "resetTime": "2026-11-20T22:00:00Z"
+                        }]
+                    }))
+                }
+            },
+            |_| Ok(refreshed.clone()),
+        )
+        .unwrap();
+        assert_eq!(collected.credential_label, "Google AI Pro");
+        assert_eq!(collected.limits[0].name, "Gemini Pro");
+        assert!((collected.limits[0].remaining_percent.unwrap() - 60.0).abs() < 1e-6);
+
+        let err = collect_antigravity_cloudcode_with(
+            &refreshed,
+            &AntigravityOAuthStore::None,
+            |_url, _body, _headers| Err(anyhow!("HTTP 401: fresh-access-token invalid")),
+            |_| unreachable!(),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(!message.contains("fresh-access-token"));
+        assert!(message.contains("[redacted]"));
+    }
+
+    #[test]
+    fn antigravity_config_validation_and_api_unknown_balance() {
+        let config: Config = serde_json::from_value(json!({
+            "accounts": [
+                {
+                    "provider": "antigravity",
+                    "accountId": "good",
+                    "label": "Google AI Pro",
+                    "authType": "subscription"
+                },
+                {
+                    "provider": "antigravity",
+                    "accountId": "bad-source",
+                    "label": "Bad source",
+                    "source": "bogus"
+                },
+                {
+                    "provider": "antigravity",
+                    "accountId": "bad-mgmt",
+                    "label": "Bad mgmt",
+                    "managementKeyEnv": "FOO"
+                },
+                {
+                    "provider": "antigravity",
+                    "accountId": "conflict",
+                    "label": "Conflict",
+                    "tokenEnv": "A",
+                    "tokenSecretRef": {
+                        "kind": "macos-keychain",
+                        "service": "svc",
+                        "account": "acct"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        let (specs, errors) = configured_accounts(&config);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].account_id, "good");
+        assert_eq!(errors.len(), 3);
+
+        let api_spec: AccountSpec = serde_json::from_value(json!({
+            "provider": "antigravity",
+            "accountId": "studio-key",
+            "label": "Google AI Studio",
+            "authType": "api"
+        }))
+        .unwrap();
+        let api_result = collect_antigravity(&api_spec).unwrap();
+        assert_eq!(api_result.limits.len(), 1);
+        assert_eq!(api_result.limits[0].status, LimitStatus::Unknown);
+        assert!(api_result.limits[0].remaining.is_none());
+    }
+
+    #[test]
+    fn renders_antigravity_card_within_pane_widths() {
+        let account = CapacityAccount {
+            provider: "antigravity".into(),
+            account_id: "google-pro".into(),
+            label: "Google AI Pro".into(),
+            auth_type: "subscription".into(),
+            credential_label: "Google AI Pro".into(),
+            capacity_scope: "subscription_quota".into(),
+            limits: vec![
+                CapacityLimit {
+                    name: "5h · Gemini".into(),
+                    kind: "quota".into(),
+                    unit: "percent".into(),
+                    remaining: None,
+                    total: None,
+                    remaining_percent: Some(93.0),
+                    resets_at: Some(Utc::now() + Duration::hours(2)),
+                    status: LimitStatus::Ok,
+                    detail: String::new(),
+                },
+                CapacityLimit {
+                    name: "7d · Cl/GPT".into(),
+                    kind: "quota".into(),
+                    unit: "percent".into(),
+                    remaining: None,
+                    total: None,
+                    remaining_percent: Some(42.0),
+                    resets_at: Some(Utc::now() + Duration::days(3)),
+                    status: LimitStatus::Ok,
+                    detail: String::new(),
+                },
+            ],
+            fetched_at: Utc::now(),
+            error: String::new(),
+            warning: String::new(),
+            collector_fingerprint: String::new(),
+        };
+        let wide = strip_ansi(&render(
+            &Config::default(),
+            std::slice::from_ref(&account),
+            false,
+            60,
+        ));
+        assert!(wide.contains("GOOGLE ANTIGRAVITY"));
+        assert!(wide.contains("Google AI Pro"));
+        assert!(wide.contains("5h · Gemini"));
+        assert!(wide.contains("7d · Cl/GPT"));
+        for width in [18, 20, 28, 36, 60] {
+            let output = render(
+                &Config::default(),
+                std::slice::from_ref(&account),
+                false,
+                width,
+            );
+            for line in output.lines() {
+                let plain = strip_ansi(line);
+                assert!(
+                    UnicodeWidthStr::width(plain.as_str()) <= width,
+                    "line exceeds width {width}: {plain:?}"
+                );
+            }
         }
     }
 

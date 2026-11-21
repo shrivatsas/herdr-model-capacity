@@ -2159,7 +2159,7 @@ fn antigravity_fraction_to_percent(fraction: Option<f64>) -> Result<Option<f64>>
     let Some(value) = fraction else {
         return Ok(None);
     };
-    if !value.is_finite() || value < 0.0 || value > 1.0 + 1e-6 {
+    if !value.is_finite() || !(0.0..=1.0 + 1e-6).contains(&value) {
         return Err(anyhow!(
             "Antigravity returned an out-of-range quota fraction"
         ));
@@ -2971,13 +2971,10 @@ fn read_antigravity_keyring(allow_keychain: bool) -> Option<(Value, AntigravityO
         if raw.trim().is_empty() {
             return None;
         }
-        return Some((
+        Some((
             parse_antigravity_oauth_value(&raw),
-            AntigravityOAuthStore::Keychain {
-                service: "gemini".into(),
-                account: "antigravity".into(),
-            },
-        ));
+            AntigravityOAuthStore::None,
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -3005,33 +3002,72 @@ fn read_antigravity_keyring(allow_keychain: bool) -> Option<(Value, AntigravityO
     }
 }
 
-fn antigravity_oauth_candidate_paths(spec: &AccountSpec) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = &spec.config_dir {
-        dirs.push(expand_home(dir));
-    } else {
-        if let Some(dir) = env::var_os("ANTIGRAVITY_APP_DATA_DIR") {
-            let dir = PathBuf::from(dir);
-            dirs.push(if dir.is_absolute() {
-                dir
-            } else {
-                expand_home(&dir)
-            });
-        }
-        dirs.push(home_dir().join(".gemini/antigravity-cli"));
-        dirs.push(home_dir().join(".gemini"));
+fn antigravity_oauth_files_in_dir(dir: &Path) -> Vec<PathBuf> {
+    [
+        "antigravity-oauth-token",
+        "oauth_creds.json",
+        "credentials.json",
+    ]
+    .into_iter()
+    .map(|filename| dir.join(filename))
+    .collect()
+}
+
+fn antigravity_oauth_is_current(oauth: &Value, now: DateTime<Utc>) -> bool {
+    antigravity_oauth_access_token(oauth).is_some()
+        && !antigravity_oauth_expiry(oauth).is_some_and(|expires| expires <= now)
+}
+
+fn antigravity_oauth_can_refresh(oauth: &Value, has_env_client_id: bool) -> bool {
+    let has_refresh = oauth
+        .get("refresh_token")
+        .or_else(|| oauth.get("refreshToken"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_client_id = has_env_client_id
+        || oauth
+            .get("client_id")
+            .or_else(|| oauth.get("clientId"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    has_refresh && has_client_id
+}
+
+fn select_antigravity_oauth_candidate<T>(
+    candidates: Vec<(Value, T)>,
+    now: DateTime<Utc>,
+    has_env_client_id: bool,
+) -> Option<(Value, T)> {
+    if let Some(index) = candidates
+        .iter()
+        .position(|(oauth, _)| antigravity_oauth_is_current(oauth, now))
+    {
+        return Some(candidates.into_iter().nth(index).unwrap());
     }
-    let mut paths = Vec::new();
+    if let Some(index) = candidates
+        .iter()
+        .position(|(oauth, _)| antigravity_oauth_can_refresh(oauth, has_env_client_id))
+    {
+        return Some(candidates.into_iter().nth(index).unwrap());
+    }
+    candidates.into_iter().next()
+}
+
+fn read_antigravity_oauth_files(dirs: &[PathBuf]) -> Vec<(Value, AntigravityOAuthStore)> {
+    let mut found = Vec::new();
     for dir in dirs {
-        for filename in [
-            "antigravity-oauth-token",
-            "oauth_creds.json",
-            "credentials.json",
-        ] {
-            paths.push(dir.join(filename));
+        for candidate in antigravity_oauth_files_in_dir(dir) {
+            if let Ok(raw) = fs::read_to_string(&candidate) {
+                if !raw.trim().is_empty() {
+                    found.push((
+                        parse_antigravity_oauth_value(&raw),
+                        AntigravityOAuthStore::File(candidate),
+                    ));
+                }
+            }
         }
     }
-    paths
+    found
 }
 
 fn antigravity_oauth_credential(spec: &AccountSpec) -> Result<(Value, AntigravityOAuthStore)> {
@@ -3054,20 +3090,35 @@ fn antigravity_oauth_credential(spec: &AccountSpec) -> Result<(Value, Antigravit
             AntigravityOAuthStore::from_secret_ref(reference),
         ));
     }
-    for candidate in antigravity_oauth_candidate_paths(spec) {
-        if let Ok(raw) = fs::read_to_string(&candidate) {
-            if !raw.trim().is_empty() {
-                return Ok((
-                    parse_antigravity_oauth_value(&raw),
-                    AntigravityOAuthStore::File(candidate),
-                ));
-            }
+
+    let mut candidates = Vec::new();
+    if let Some(dir) = &spec.config_dir {
+        candidates.extend(read_antigravity_oauth_files(&[expand_home(dir)]));
+    } else {
+        let mut agy_dirs = Vec::new();
+        if let Some(dir) = env::var_os("ANTIGRAVITY_APP_DATA_DIR") {
+            let dir = PathBuf::from(dir);
+            agy_dirs.push(if dir.is_absolute() {
+                dir
+            } else {
+                expand_home(&dir)
+            });
         }
-    }
-    if spec.config_dir.is_none() {
+        agy_dirs.push(home_dir().join(".gemini/antigravity-cli"));
+        candidates.extend(read_antigravity_oauth_files(&agy_dirs));
         if let Some(found) = read_antigravity_keyring(spec.allow_keychain) {
-            return Ok(found);
+            candidates.push(found);
         }
+        candidates.extend(read_antigravity_oauth_files(&[home_dir().join(".gemini")]));
+    }
+
+    let has_env_client_id = env::var("ANTIGRAVITY_OAUTH_CLIENT_ID")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if let Some(selected) =
+        select_antigravity_oauth_candidate(candidates, Utc::now(), has_env_client_id)
+    {
+        return Ok(selected);
     }
     if cfg!(target_os = "macos") && !spec.allow_keychain && spec.config_dir.is_none() {
         return Err(anyhow!(
@@ -6824,6 +6875,65 @@ LISTEN  0      128    127.0.0.1:49999     0.0.0.0:*         users:((\"other\",pi
         let parsed = parse_antigravity_quota_summary(&flat_summary).unwrap();
         assert_eq!(parsed.limits[0].name, "5h · Gemini");
         assert!((parsed.limits[0].remaining_percent.unwrap() - 88.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expired_antigravity_file_yields_to_current_keyring_token() {
+        let now = Utc::now();
+        let expired_gemini_cli = json!({
+            "access_token": "ya29.old-gemini-cli",
+            "refresh_token": "1//old",
+            "expiry_date": (now - Duration::days(30)).timestamp_millis()
+        });
+        let fresh_expiry = (now + Duration::minutes(45)).to_rfc3339();
+        let agy_envelope = json!({
+            "auth_method": "consumer",
+            "id_token_email": "user@example.com",
+            "token": {
+                "access_token": "ya29.fresh-agy",
+                "refresh_token": "1//agy",
+                "token_type": "Bearer",
+                "expiry": fresh_expiry
+            }
+        });
+        let parsed_agy = parse_antigravity_oauth_value(&agy_envelope.to_string());
+        assert_eq!(
+            antigravity_oauth_access_token(&parsed_agy),
+            Some("ya29.fresh-agy")
+        );
+        assert!(antigravity_oauth_is_current(&parsed_agy, now));
+
+        let (selected, source) = select_antigravity_oauth_candidate(
+            vec![
+                (expired_gemini_cli.clone(), "file"),
+                (parsed_agy, "keyring"),
+            ],
+            now,
+            false,
+        )
+        .unwrap();
+        assert_eq!(source, "keyring");
+        assert_eq!(
+            antigravity_oauth_access_token(&selected),
+            Some("ya29.fresh-agy")
+        );
+
+        let refreshable_expired = json!({
+            "access_token": "ya29.expired-refreshable",
+            "refresh_token": "1//rt",
+            "client_id": "cid",
+            "expiry_date": (now - Duration::hours(1)).timestamp_millis()
+        });
+        let (_, source) = select_antigravity_oauth_candidate(
+            vec![
+                (expired_gemini_cli, "unrefreshable"),
+                (refreshable_expired, "refreshable"),
+            ],
+            now,
+            false,
+        )
+        .unwrap();
+        assert_eq!(source, "refreshable");
     }
 
     #[test]

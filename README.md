@@ -303,26 +303,29 @@ optional Amp agent binding; configuring one does not create the other.
 
 Antigravity and Google AI Pro/Ultra subscription capacity is configured with
 `"provider": "antigravity"`. It supports two collection paths and defaults to
-`"source": "auto"`:
+`"source": "auto"` (trying Google OAuth / `agy` CLI credentials first, then
+falling back to a local Antigravity IDE/App language server):
 
-- **Local Antigravity language server (`"source": "local"` or default in `"auto"`)**:
-  Finds a running Antigravity app, IDE, or `agy` CLI language server process
-  (matching `--app_data_dir` when `configDir` is set), discovers its loopback
-  port, and queries Connect-RPC on `127.0.0.1` (`RetrieveUserQuotaSummary` for
-  grouped 5-hour and weekly windows across Gemini and Claude/GPT pools, falling
-  back to `GetUserStatus` and `GetCommandModelConfigs` for per-pool model
-  quotas). Antigravity owns login and session management; TLS verification is
-  relaxed strictly for `127.0.0.1` self-signed certificates and CSRF tokens are
-  redacted from errors.
-- **Google OAuth / Cloud Code API (`"source": "oauth"`, or when `tokenEnv` /
-  `tokenSecretRef` / `secretRef` is set, or as `"auto"` fallback when
-  `~/.gemini/oauth_creds.json` is present)**: Reads a Google OAuth token or
-  `oauth_creds.json` from `configDir` (default `~/.gemini`), an environment
-  variable, or a `macos-keychain` secret reference, refreshes expired tokens via
-  `oauth2.googleapis.com/token` when a refresh token and `client_id` (or
-  `ANTIGRAVITY_OAUTH_CLIENT_ID`) are available, and queries
-  `v1internal:retrieveUserQuotaSummary` with fallback to
+- **Google OAuth / `agy` CLI / Cloud Code API (`"source": "oauth"` or `"agy"`,
+  or default in `"auto"`, or when `tokenEnv` / `tokenSecretRef` / `secretRef`
+  is set)**: Reads `agy`'s OAuth token from
+  `~/.gemini/antigravity-cli/antigravity-oauth-token` (or
+  `$ANTIGRAVITY_APP_DATA_DIR`), `~/.gemini/oauth_creds.json`, or the system
+  keyring (`service=gemini`, `username=antigravity` via `secret-tool` on Linux
+  or macOS Keychain when `"allowKeychain": true` is set), as well as explicit
+  `configDir`, `tokenEnv`, `tokenSecretRef`, or `secretRef` overrides.
+  Refreshes expired tokens via `oauth2.googleapis.com/token` when a refresh
+  token and `client_id` (or `ANTIGRAVITY_OAUTH_CLIENT_ID`) are available, and
+  queries `v1internal:retrieveUserQuotaSummary` with fallback to
   `v1internal:loadCodeAssist` + `v1internal:retrieveUserQuota`.
+- **Local Antigravity IDE/App language server (`"source": "local"` or fallback
+  in `"auto"`)**: Finds a running Antigravity IDE or desktop app language
+  server process (matching `--app_data_dir` when `configDir` is set), discovers
+  its loopback port, and queries Connect-RPC on `127.0.0.1`
+  (`RetrieveUserQuotaSummary`, falling back to `GetUserStatus` and
+  `GetCommandModelConfigs`). TLS verification is relaxed strictly for
+  `127.0.0.1` self-signed certificates and CSRF tokens are redacted from
+  errors.
 
 Ordinary Google AI Studio API keys (`"authType": "api"` or `"source": "api"`)
 do not expose a prepaid balance endpoint and are shown as **unknown**, never as

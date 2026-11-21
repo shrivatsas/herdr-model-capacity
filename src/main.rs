@@ -1900,8 +1900,7 @@ fn parse_antigravity_processes(
             .to_ascii_lowercase();
         let app_data_dir = extract_flag_value(&tokens, "--app_data_dir")
             .or_else(|| extract_flag_value(&tokens, "--app-data-dir"));
-        let is_desktop_ls = (exe_name.starts_with("language_server_macos")
-            || exe_name.starts_with("language_server_linux")
+        let is_desktop_ls = (exe_name.starts_with("language_server")
             || lower_cmd.contains("language_server_macos")
             || lower_cmd.contains("language_server_linux"))
             && (lower_cmd.contains("antigravity")
@@ -1946,16 +1945,19 @@ fn parse_antigravity_processes(
             });
         }
     }
-    // Prefer `agy` / Antigravity app language servers ahead of IDE-only servers
-    // because they expose `RetrieveUserQuotaSummary` (5h + 7d grouped windows).
+    // Prefer processes with an explicit CSRF token (Antigravity app language
+    // servers ahead of IDE-only servers, since the app exposes
+    // `RetrieveUserQuotaSummary`), and fall back to tokenless `agy` last
+    // (`agy` >= 1.2.2 enforces an in-process CSRF token on loopback ports).
     processes.sort_by_key(|process| {
+        let has_csrf = process.csrf_token.is_some();
         let is_cli_dir = process
             .app_data_dir
             .as_deref()
             .is_some_and(|dir| dir.to_ascii_lowercase().contains("antigravity-cli"));
-        if process.is_agy || is_cli_dir {
+        if has_csrf && (process.is_agy || is_cli_dir || process.extension_server_port.is_none()) {
             0
-        } else if process.extension_server_port.is_none() {
+        } else if has_csrf {
             1
         } else {
             2
@@ -2290,58 +2292,73 @@ fn antigravity_sort_key(name: &str) -> (u8, u8, String) {
 
 fn parse_antigravity_quota_summary(data: &Value) -> Result<CollectedCapacity> {
     let root = data.get("response").unwrap_or(data);
-    let groups = root
-        .get("groups")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("Antigravity quota summary omitted groups"))?;
-    let single_group = groups.len() == 1;
     let mut limits = Vec::new();
-    for group in groups {
-        let group_name = group
-            .get("displayName")
-            .or_else(|| group.get("display_name"))
-            .or_else(|| group.get("name"))
+    let mut push_bucket = |group_name: &str, single_unnamed: bool, bucket: &Value| -> Result<()> {
+        let bucket_id = bucket
+            .get("bucketId")
+            .or_else(|| bucket.get("bucket_id"))
+            .or_else(|| bucket.get("id"))
+            .or_else(|| bucket.get("modelId"))
+            .or_else(|| bucket.get("model_id"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
-            continue;
+        let window = antigravity_window_label(bucket);
+        let family = antigravity_group_label(group_name, bucket_id);
+        let name = if family.is_empty() || single_unnamed {
+            window
+        } else {
+            format!("{window} · {family}")
         };
-        for bucket in buckets {
-            let bucket_id = bucket
-                .get("bucketId")
-                .or_else(|| bucket.get("bucket_id"))
-                .or_else(|| bucket.get("id"))
+        let fraction = bucket
+            .get("remainingFraction")
+            .or_else(|| bucket.get("remaining_fraction"))
+            .and_then(Value::as_f64);
+        let remaining_percent = antigravity_fraction_to_percent(fraction)?;
+        let reset = parse_time(bucket.get("resetTime").or_else(|| bucket.get("reset_time")));
+        limits.push(CapacityLimit {
+            name,
+            kind: "quota".into(),
+            unit: "percent".into(),
+            remaining: None,
+            total: None,
+            remaining_percent,
+            resets_at: reset,
+            status: if remaining_percent.is_some() {
+                LimitStatus::Ok
+            } else {
+                LimitStatus::Unknown
+            },
+            detail: String::new(),
+        });
+        Ok(())
+    };
+    if let Some(groups) = root.get("groups").and_then(Value::as_array) {
+        let single_group = groups.len() == 1;
+        for group in groups {
+            let group_name = group
+                .get("displayName")
+                .or_else(|| group.get("display_name"))
+                .or_else(|| group.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let window = antigravity_window_label(bucket);
-            let family = antigravity_group_label(group_name, bucket_id);
-            let name = if family.is_empty() || (single_group && group_name.trim().is_empty()) {
-                window
-            } else {
-                format!("{window} · {family}")
+            let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+                continue;
             };
-            let fraction = bucket
-                .get("remainingFraction")
-                .or_else(|| bucket.get("remaining_fraction"))
-                .and_then(Value::as_f64);
-            let remaining_percent = antigravity_fraction_to_percent(fraction)?;
-            let reset = parse_time(bucket.get("resetTime").or_else(|| bucket.get("reset_time")));
-            limits.push(CapacityLimit {
-                name,
-                kind: "quota".into(),
-                unit: "percent".into(),
-                remaining: None,
-                total: None,
-                remaining_percent,
-                resets_at: reset,
-                status: if remaining_percent.is_some() {
-                    LimitStatus::Ok
-                } else {
-                    LimitStatus::Unknown
-                },
-                detail: String::new(),
-            });
+            let single_unnamed = single_group && group_name.trim().is_empty();
+            for bucket in buckets {
+                push_bucket(group_name, single_unnamed, bucket)?;
+            }
         }
+    } else if let Some(buckets) = root
+        .get("buckets")
+        .or_else(|| root.get("quotaBuckets"))
+        .and_then(Value::as_array)
+    {
+        for bucket in buckets {
+            push_bucket("", false, bucket)?;
+        }
+    } else {
+        return Err(anyhow!("Antigravity quota summary omitted groups"));
     }
     if limits.is_empty() {
         return Err(anyhow!(
@@ -2577,8 +2594,10 @@ fn collect_antigravity_from_endpoint_with(
 }
 
 fn collect_antigravity_local(spec: &AccountSpec) -> Result<CollectedCapacity> {
+    // `-ww` prevents procps on Linux from truncating long command lines at 80
+    // columns, which otherwise cuts off `--csrf_token` on language server args.
     let ps = Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
+        .args(["-axww", "-o", "pid=,command="])
         .stdin(Stdio::null())
         .output()
         .context("list running Antigravity processes")?;
@@ -2633,9 +2652,18 @@ fn collect_antigravity_local(spec: &AccountSpec) -> Result<CollectedCapacity> {
     if let Some(fallback) = best_fallback {
         return Ok(fallback);
     }
-    Err(last_error.unwrap_or_else(|| {
-        anyhow!("could not reach Antigravity local language server on loopback")
-    }))
+    if let Some(error) = last_error {
+        let detail = format!("{error:#}");
+        if detail.contains("missing CSRF token") {
+            return Err(anyhow!(
+                "Antigravity local server rejected tokenless request (agy 1.2.2+ requires an in-process CSRF token; open Antigravity IDE/App)"
+            ));
+        }
+        return Err(error);
+    }
+    Err(anyhow!(
+        "could not reach Antigravity local language server on loopback"
+    ))
 }
 
 enum AntigravityOAuthStore {
@@ -2708,11 +2736,117 @@ impl AntigravityOAuthStore {
     }
 }
 
-fn parse_antigravity_oauth_value(raw: &str) -> Value {
-    let trimmed = raw.trim();
+fn decode_hex_utf8(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.len() < 4
+        || !trimmed.len().is_multiple_of(2)
+        || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(trimmed.len() / 2);
+    for chunk in trimmed.as_bytes().as_chunks::<2>().0 {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Minimal standard Base64 decoder used to unwrap `zalando/go-keyring`'s
+/// `go-keyring-base64:` macOS Keychain encoding without adding a new crate.
+fn decode_base64_utf8(text: &str) -> Option<String> {
+    let mut values = Vec::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            values.push(0xff);
+            continue;
+        }
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        values.push(val);
+    }
+    if values.is_empty() || !values.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(values.len() / 4 * 3);
+    for chunk in values.as_chunks::<4>().0 {
+        let [a, b, c, d] = *chunk;
+        if a == 0xff || b == 0xff {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if c != 0xff {
+            out.push((b << 4) | (c >> 2));
+            if d != 0xff {
+                out.push((c << 6) | d);
+            }
+        } else if d != 0xff {
+            return None;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn unwrap_antigravity_oauth_object(value: Value) -> Value {
+    for key in ["token", "oauthToken", "oauth_token", "oauth", "credentials"] {
+        if let Some(inner) = value.get(key).filter(|inner| inner.is_object()) {
+            if antigravity_oauth_access_token(inner).is_some()
+                || inner.get("refresh_token").is_some()
+                || inner.get("refreshToken").is_some()
+            {
+                return inner.clone();
+            }
+        }
+    }
+    value
+}
+
+fn try_parse_antigravity_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         if value.is_object() {
+            return Some(unwrap_antigravity_oauth_object(value));
+        }
+    }
+    if let Some(encoded) = trimmed.strip_prefix("go-keyring-base64:") {
+        if let Some(decoded) = decode_base64_utf8(encoded) {
+            if let Ok(value) = serde_json::from_str::<Value>(decoded.trim()) {
+                if value.is_object() {
+                    return Some(unwrap_antigravity_oauth_object(value));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_antigravity_oauth_value(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    if let Some(value) = try_parse_antigravity_json(trimmed) {
+        return value;
+    }
+    if let Some(decoded) = decode_hex_utf8(trimmed) {
+        if let Some(value) = try_parse_antigravity_json(&decoded) {
             return value;
+        }
+        if let Some(encoded) = decoded.trim().strip_prefix("go-keyring-base64:") {
+            if let Some(plain) = decode_base64_utf8(encoded) {
+                return json!({ "access_token": plain.trim() });
+            }
+        }
+    }
+    if let Some(encoded) = trimmed.strip_prefix("go-keyring-base64:") {
+        if let Some(plain) = decode_base64_utf8(encoded) {
+            return json!({ "access_token": plain.trim() });
         }
     }
     json!({ "access_token": trimmed })
@@ -2727,12 +2861,17 @@ fn antigravity_oauth_access_token(oauth: &Value) -> Option<&str> {
 }
 
 fn antigravity_oauth_expiry(oauth: &Value) -> Option<DateTime<Utc>> {
+    // Go's `oauth2.Token` serializes its timestamp as `expiry` (RFC3339) and
+    // uses `0001-01-01T00:00:00Z` when unset; ignore timestamps <= Unix epoch
+    // so an unset Go zero time is never mistaken for an expired token.
     parse_time(
         oauth
-            .get("expiry_date")
+            .get("expiry")
+            .or_else(|| oauth.get("expiry_date"))
             .or_else(|| oauth.get("expires_at"))
             .or_else(|| oauth.get("expiresAt")),
     )
+    .filter(|time| time.timestamp() > 0)
 }
 
 fn refresh_antigravity_oauth_with(
@@ -2788,14 +2927,111 @@ fn refresh_antigravity_oauth_with(
         .get("expires_in")
         .and_then(Value::as_f64)
         .unwrap_or(3600.0);
-    let now_ms = Utc::now().timestamp_millis();
+    let now = Utc::now();
+    let expires_at = now + Duration::seconds(expires_in.round() as i64);
     let mut merged = oauth.clone();
     merged["access_token"] = json!(access_token);
     if let Some(new_rt) = response.get("refresh_token").and_then(Value::as_str) {
         merged["refresh_token"] = json!(new_rt);
     }
-    merged["expiry_date"] = json!(now_ms + (expires_in * 1000.0) as i64);
+    if merged.get("expiry").is_some() {
+        merged["expiry"] = json!(expires_at.to_rfc3339());
+    }
+    merged["expiry_date"] = json!(expires_at.timestamp_millis());
     Ok(merged)
+}
+
+/// Read Antigravity CLI's (`agy`) stored OAuth payload from the OS keyring.
+/// `agy` persists tokens via `zalando/go-keyring` under service `"gemini"` and
+/// username/account `"antigravity"`:
+/// - Linux: FreeDesktop Secret Service via `secret-tool`
+/// - macOS: Apple Keychain via `security` (opt-in with `allowKeychain: true`)
+fn read_antigravity_keyring(allow_keychain: bool) -> Option<(Value, AntigravityOAuthStore)> {
+    #[cfg(target_os = "macos")]
+    {
+        if !allow_keychain {
+            return None;
+        }
+        let output = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "gemini",
+                "-a",
+                "antigravity",
+                "-w",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8(output.stdout).ok()?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        return Some((
+            parse_antigravity_oauth_value(&raw),
+            AntigravityOAuthStore::Keychain {
+                service: "gemini".into(),
+                account: "antigravity".into(),
+            },
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = allow_keychain;
+        for user_attr in ["username", "user"] {
+            let Ok(output) = Command::new("secret-tool")
+                .args(["lookup", "service", "gemini", user_attr, "antigravity"])
+                .stdin(Stdio::null())
+                .output()
+            else {
+                return None;
+            };
+            if output.status.success() {
+                if let Ok(raw) = String::from_utf8(output.stdout) {
+                    if !raw.trim().is_empty() {
+                        return Some((
+                            parse_antigravity_oauth_value(&raw),
+                            AntigravityOAuthStore::None,
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn antigravity_oauth_candidate_paths(spec: &AccountSpec) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = &spec.config_dir {
+        dirs.push(expand_home(dir));
+    } else {
+        if let Some(dir) = env::var_os("ANTIGRAVITY_APP_DATA_DIR") {
+            let dir = PathBuf::from(dir);
+            dirs.push(if dir.is_absolute() {
+                dir
+            } else {
+                expand_home(&dir)
+            });
+        }
+        dirs.push(home_dir().join(".gemini/antigravity-cli"));
+        dirs.push(home_dir().join(".gemini"));
+    }
+    let mut paths = Vec::new();
+    for dir in dirs {
+        for filename in [
+            "antigravity-oauth-token",
+            "oauth_creds.json",
+            "credentials.json",
+        ] {
+            paths.push(dir.join(filename));
+        }
+    }
+    paths
 }
 
 fn antigravity_oauth_credential(spec: &AccountSpec) -> Result<(Value, AntigravityOAuthStore)> {
@@ -2818,20 +3054,28 @@ fn antigravity_oauth_credential(spec: &AccountSpec) -> Result<(Value, Antigravit
             AntigravityOAuthStore::from_secret_ref(reference),
         ));
     }
-    let dir = spec
-        .config_dir
-        .as_ref()
-        .map(expand_home)
-        .unwrap_or_else(|| home_dir().join(".gemini"));
-    for filename in ["oauth_creds.json", "credentials.json"] {
-        let candidate = dir.join(filename);
-        if let Some(value) = read_json(&candidate) {
-            return Ok((value, AntigravityOAuthStore::File(candidate)));
+    for candidate in antigravity_oauth_candidate_paths(spec) {
+        if let Ok(raw) = fs::read_to_string(&candidate) {
+            if !raw.trim().is_empty() {
+                return Ok((
+                    parse_antigravity_oauth_value(&raw),
+                    AntigravityOAuthStore::File(candidate),
+                ));
+            }
         }
     }
+    if spec.config_dir.is_none() {
+        if let Some(found) = read_antigravity_keyring(spec.allow_keychain) {
+            return Ok(found);
+        }
+    }
+    if cfg!(target_os = "macos") && !spec.allow_keychain && spec.config_dir.is_none() {
+        return Err(anyhow!(
+            "no Antigravity OAuth token file found; set allowKeychain: true to read agy's macOS Keychain item, or configure configDir / tokenEnv / tokenSecretRef"
+        ));
+    }
     Err(anyhow!(
-        "no Google OAuth credential found in {}",
-        dir.display()
+        "no Antigravity OAuth credential found (checked ~/.gemini/antigravity-cli/antigravity-oauth-token, ~/.gemini/oauth_creds.json, and system keyring via secret-tool)"
     ))
 }
 
@@ -2951,16 +3195,16 @@ fn collect_antigravity(spec: &AccountSpec) -> Result<CollectedCapacity> {
     let has_explicit_oauth =
         spec.token_env.is_some() || spec.token_secret_ref.is_some() || spec.secret_ref.is_some();
     match source.as_str() {
-        "local" | "antigravity" | "ide" | "app" | "agy" => collect_antigravity_local(spec),
-        "oauth" | "cloudcode" | "gemini-cli" => collect_antigravity_oauth(spec),
+        "local" | "antigravity" | "ide" | "app" => collect_antigravity_local(spec),
+        "oauth" | "cloudcode" | "gemini-cli" | "agy" => collect_antigravity_oauth(spec),
         _ if has_explicit_oauth => collect_antigravity_oauth(spec),
-        _ => match collect_antigravity_local(spec) {
+        _ => match collect_antigravity_oauth(spec) {
             Ok(collected) => Ok(collected),
-            Err(local_error) => match collect_antigravity_oauth(spec) {
+            Err(oauth_error) => match collect_antigravity_local(spec) {
                 Ok(collected) => Ok(collected),
-                Err(_) => Err(anyhow!(
-                    "{local_error:#}; or configure configDir, tokenEnv, or tokenSecretRef"
-                )),
+                Err(local_error) => {
+                    Err(anyhow!("{oauth_error:#}; local fallback: {local_error:#}"))
+                }
             },
         },
     }
@@ -6310,12 +6554,12 @@ mod tests {
         let processes = parse_antigravity_processes(ps_output, None);
         // Tokenless desktop language server (102), `agy --help` (104), and unrelated (105) skipped.
         assert_eq!(processes.len(), 2);
-        // `agy` CLI process is prioritized ahead of IDE language server.
-        assert_eq!(processes[0].pid, 103);
-        assert!(processes[0].is_agy);
-        assert_eq!(processes[1].pid, 101);
-        assert_eq!(processes[1].csrf_token.as_deref(), Some("ide-secret"));
-        assert_eq!(processes[1].extension_server_port, Some(41234));
+        // Language server with an explicit CSRF token is prioritized ahead of tokenless `agy`.
+        assert_eq!(processes[0].pid, 101);
+        assert_eq!(processes[0].csrf_token.as_deref(), Some("ide-secret"));
+        assert_eq!(processes[0].extension_server_port, Some(41234));
+        assert_eq!(processes[1].pid, 103);
+        assert!(processes[1].is_agy);
 
         let filtered = parse_antigravity_processes(ps_output, Some("antigravity-cli"));
         assert_eq!(filtered.len(), 1);
@@ -6512,6 +6756,74 @@ LISTEN  0      128    127.0.0.1:49999     0.0.0.0:*         users:((\"other\",pi
         assert_eq!(api_result.limits.len(), 1);
         assert_eq!(api_result.limits[0].status, LimitStatus::Unknown);
         assert!(api_result.limits[0].remaining.is_none());
+    }
+
+    #[test]
+    fn parses_antigravity_oauth_formats_and_ignores_go_zero_expiry() {
+        // Go `oauth2.Token` with RFC3339 `expiry`
+        let go_token = parse_antigravity_oauth_value(
+            r#"{"access_token":"ya29.abc","refresh_token":"1//xyz","expiry":"2026-11-21T08:00:00Z"}"#,
+        );
+        assert_eq!(antigravity_oauth_access_token(&go_token), Some("ya29.abc"));
+        assert!(antigravity_oauth_expiry(&go_token).is_some());
+
+        // Go zero timestamp (`0001-01-01T00:00:00Z`) must not look expired.
+        let zero_expiry = parse_antigravity_oauth_value(
+            r#"{"access_token":"ya29.abc","expiry":"0001-01-01T00:00:00Z"}"#,
+        );
+        assert_eq!(antigravity_oauth_expiry(&zero_expiry), None);
+
+        // Nested token object, hex-encoded JSON, and `go-keyring-base64:` (macOS `zalando/go-keyring`).
+        let nested = r#"{"token":{"access_token":"ya29.nested"}}"#;
+        assert_eq!(
+            antigravity_oauth_access_token(&parse_antigravity_oauth_value(nested)),
+            Some("ya29.nested")
+        );
+        let hex = hex_lower(nested.as_bytes());
+        assert_eq!(
+            antigravity_oauth_access_token(&parse_antigravity_oauth_value(&hex)),
+            Some("ya29.nested")
+        );
+        // `{"access_token":"ya29.mac"}` base64-encoded as `zalando/go-keyring` stores on macOS.
+        let go_keyring = "go-keyring-base64:eyJhY2Nlc3NfdG9rZW4iOiJ5YTI5Lm1hYyJ9";
+        assert_eq!(
+            antigravity_oauth_access_token(&parse_antigravity_oauth_value(go_keyring)),
+            Some("ya29.mac")
+        );
+        let hex_go_keyring = hex_lower(go_keyring.as_bytes());
+        assert_eq!(
+            antigravity_oauth_access_token(&parse_antigravity_oauth_value(&hex_go_keyring)),
+            Some("ya29.mac")
+        );
+
+        // Refreshing a Go `oauth2.Token` updates `expiry` so it is no longer seen as expired.
+        let expired_go = json!({
+            "access_token": "old",
+            "refresh_token": "rt",
+            "expiry": (Utc::now() - Duration::hours(1)).to_rfc3339(),
+            "client_id": "cid"
+        });
+        let refreshed_go = refresh_antigravity_oauth_with(
+            &expired_go,
+            |_| None,
+            |_, _| Ok(json!({"access_token": "new", "expires_in": 3600})),
+        )
+        .unwrap();
+        assert!(antigravity_oauth_expiry(&refreshed_go).is_some_and(|exp| exp > Utc::now()));
+
+        // Flat buckets array in quota summary fallback.
+        let flat_summary = json!({
+            "buckets": [
+                {
+                    "bucketId": "gemini-5h",
+                    "remainingFraction": 0.88,
+                    "resetTime": "2026-11-21T15:00:00Z"
+                }
+            ]
+        });
+        let parsed = parse_antigravity_quota_summary(&flat_summary).unwrap();
+        assert_eq!(parsed.limits[0].name, "5h · Gemini");
+        assert!((parsed.limits[0].remaining_percent.unwrap() - 88.0).abs() < 1e-6);
     }
 
     #[test]

@@ -162,7 +162,18 @@ else:
 ' "$WORKSPACE" "$CAPACITY_PANE" "${HERDR_PANE_ID:-}")"
 
 if [[ -n "$CAPACITY_PANE" ]]; then
-  "$HERDR_BIN" plugin pane close "$CAPACITY_PANE"
+  # Herdr drops plugin-pane ownership when its server restarts (live update,
+  # crash) and can hand the same pane ID to an unrelated pane afterwards. The
+  # stale ID then still passes the existence check above but close fails with
+  # plugin_pane_not_found. Under `set -e` that aborts the whole action, so the
+  # stored state permanently wedges the pane open/toggle actions: nothing can
+  # be closed and nothing new opens. Treat a lost pane as already closed.
+  if ! CLOSE_ERROR="$("$HERDR_BIN" plugin pane close "$CAPACITY_PANE" 2>&1)"; then
+    if [[ "$CLOSE_ERROR" != *plugin_pane_not_found* ]]; then
+      printf '%s\n' "$CLOSE_ERROR" >&2
+      exit 1
+    fi
+  fi
   rm -f "$STATE_FILE"
   [[ "$MODE" == "toggle" ]] && exit 0
 fi

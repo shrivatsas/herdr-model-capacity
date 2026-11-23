@@ -44,6 +44,7 @@ flowchart TD
 
     D --> E{"per account:<br/><b>provider</b>"}
     E -->|anthropic| F["Claude Code OAuth credential<br/>or macOS Keychain secretRef<br/>→ api.anthropic.com/api/oauth/usage"]
+    E -->|antigravity| N["Antigravity local language server<br/>or Google OAuth Cloud Code API<br/>→ quota buckets + reset times"]
     E -->|openai| G["<b>codex app-server --stdio</b><br/>one CODEX_HOME per account<br/>account/read · account/rateLimits/read"]
     E -->|openrouter| H["openrouter.ai<br/>/api/v1/key + optional /api/v1/credits<br/>environment or macOS Keychain"]
     E -->|amp| I["<b>amp usage</b><br/>single CLI identity<br/>version-1 text parser"]
@@ -51,6 +52,7 @@ flowchart TD
     E -->|zen| M["OpenCode Zen API<br/>authenticated key check; balance unavailable"]
 
     F --> J
+    N --> J
     G --> J
     H --> J
     I --> J["<b>normalize</b> → CapacityLimit<br/>quota percent · USD balance<br/>reset time · status"]
@@ -221,6 +223,12 @@ used to help author it, but never defines dashboard accounts.
       }
     },
     {
+      "provider": "antigravity",
+      "accountId": "google-ai-pro",
+      "label": "Google AI Pro",
+      "authType": "subscription"
+    },
+    {
       "provider": "openrouter",
       "accountId": "personal-openrouter",
       "label": "Personal OpenRouter",
@@ -290,6 +298,38 @@ guessed. An Amp billing account (`"provider": "amp"`) is independent of an
 optional Amp agent binding; configuring one does not create the other.
 
 ## Provider collection and limitations
+
+### Antigravity / Google AI
+
+Antigravity and Google AI Pro/Ultra subscription capacity is configured with
+`"provider": "antigravity"`. It supports two collection paths and defaults to
+`"source": "auto"` (trying Google OAuth / `agy` CLI credentials first, then
+falling back to a local Antigravity IDE/App language server):
+
+- **Google OAuth / `agy` CLI / Cloud Code API (`"source": "oauth"` or `"agy"`,
+  or default in `"auto"`, or when `tokenEnv` / `tokenSecretRef` / `secretRef`
+  is set)**: Reads `agy`'s OAuth token from
+  `~/.gemini/antigravity-cli/antigravity-oauth-token` (or
+  `$ANTIGRAVITY_APP_DATA_DIR`), `~/.gemini/oauth_creds.json`, or the system
+  keyring (`service=gemini`, `username=antigravity` via `secret-tool` on Linux
+  or macOS Keychain when `"allowKeychain": true` is set), as well as explicit
+  `configDir`, `tokenEnv`, `tokenSecretRef`, or `secretRef` overrides.
+  Refreshes expired tokens via `oauth2.googleapis.com/token` when a refresh
+  token and `client_id` (or `ANTIGRAVITY_OAUTH_CLIENT_ID`) are available, and
+  queries `v1internal:retrieveUserQuotaSummary` with fallback to
+  `v1internal:loadCodeAssist` + `v1internal:retrieveUserQuota`.
+- **Local Antigravity IDE/App language server (`"source": "local"` or fallback
+  in `"auto"`)**: Finds a running Antigravity IDE or desktop app language
+  server process (matching `--app_data_dir` when `configDir` is set), discovers
+  its loopback port, and queries Connect-RPC on `127.0.0.1`
+  (`RetrieveUserQuotaSummary`, falling back to `GetUserStatus` and
+  `GetCommandModelConfigs`). TLS verification is relaxed strictly for
+  `127.0.0.1` self-signed certificates and CSRF tokens are redacted from
+  errors.
+
+Ordinary Google AI Studio API keys (`"authType": "api"` or `"source": "api"`)
+do not expose a prepaid balance endpoint and are shown as **unknown**, never as
+zero.
 
 ### Command Code and OpenCode Zen
 
